@@ -74,6 +74,17 @@ def parse_hermes_pdf(file_bytes):
         m = re.search(r"Forderung\s+gesamt\*?\s*€?\s*([\d.]+,[\d]+)", full_text)
         if m: result["suma"] = m.group(1).replace(".", "").replace(",", ".")
 
+        # ── VALIDARE: Hermes declara pe pagina 1 numarul de pozitii pe categorie ──
+        # "Transportschäden (Anzahl: X) €", "Verluste (Anzahl: Y) €", "Sonstige (Anzahl: Z) €"
+        # Acest text apare de obicei DE DOUA ORI in PDF (o data in scrisoare, o data
+        # repetat pe pagina Anlage) — luam doar primele 3 aparitii (Transportschaden,
+        # Verluste, Sonstige = cele 3 categorii standard Hermes), nu tot ce gasim in document.
+        anzahl_matches = re.findall(r"\(Anzahl:\s*(\d+)\)", full_text)
+        if anzahl_matches:
+            result["declaredPositionCount"] = sum(int(x) for x in anzahl_matches[:3])
+        else:
+            result["declaredPositionCount"] = None
+
         for page in pdf.pages:
             for table in page.find_tables():
                 rows = table.extract()
@@ -143,6 +154,33 @@ def parse_hermes_pdf(file_bytes):
                 return (0, 0, 0)
 
         result["pozitii"].sort(key=sort_key, reverse=True)
+
+        # ── VERIFICARE FINALA: comparam ce am extras cu ce declara Hermes ──
+        extracted_count = len(result["pozitii"])
+        extracted_sum = round(sum(p["forderung"] for p in result["pozitii"]), 2)
+        declared_count = result.get("declaredPositionCount")
+        declared_sum = float(result["suma"]) if result.get("suma") else None
+
+        warnings = []
+        if declared_count is not None and declared_count != extracted_count:
+            warnings.append(
+                f"Hermes declară {declared_count} poziții, dar am extras {extracted_count}. "
+                f"{'Lipsesc ' + str(declared_count - extracted_count) + ' poziții!' if declared_count > extracted_count else 'Sunt poziții în plus, posibil duplicate!'}"
+            )
+        if declared_sum is not None and abs(declared_sum - extracted_sum) > 0.02:
+            warnings.append(
+                f"Suma declarată de Hermes este €{declared_sum:.2f}, dar suma pozițiilor extrase este €{extracted_sum:.2f} "
+                f"(diferență €{abs(declared_sum-extracted_sum):.2f})."
+            )
+
+        result["validation"] = {
+            "ok": len(warnings) == 0,
+            "declaredCount": declared_count,
+            "extractedCount": extracted_count,
+            "declaredSum": declared_sum,
+            "extractedSum": extracted_sum,
+            "warnings": warnings,
+        }
 
     return result
 

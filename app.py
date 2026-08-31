@@ -85,66 +85,78 @@ def parse_hermes_pdf(file_bytes):
         else:
             result["declaredPositionCount"] = None
 
+        # Schema fixa Hermes (ordinea coloanelor e mereu aceasta pe toate paginile)
+        FIXED_SCHEMA = ["ident","atg","schad","kst","tour","name","str","plz","ort","datum","ford"]
+
+        def extract_row_as_position(row, idx_map):
+            def get(key):
+                i = idx_map.get(key)
+                if i is None or i >= len(row):
+                    return ""
+                return (row[i] or "").strip()
+
+            name = get("name").replace("\n", " ").strip()
+            tour = get("tour").replace("\n", " ").strip()
+            if not name and not tour:
+                return None
+            if "forderung gesamt" in get("ident").lower():
+                return None
+
+            return {
+                "tour":       tour,
+                "identnummer": get("ident").replace("\n", ""),
+                "atg":        clean_atg(get("atg")),
+                "schadenart": get("schad").replace("\n", " ").strip() or "Totalverlust",
+                "name":       name,
+                "strasse":    clean_strasse(get("str")),
+                "plz":        get("plz"),
+                "ort":        get("ort").replace("\n", " ").strip(),
+                "datum":      get("datum"),
+                "forderung":  parse_money(get("ford")),
+            }
+
         for page in pdf.pages:
             for table in page.find_tables():
                 rows = table.extract()
-                if not rows or len(rows) < 2:
+                if not rows:
                     continue
+
                 header = [h.strip().lower() if h else "" for h in rows[0]]
-                if not any("identnummer" in h for h in header):
-                    continue
-                if not any("tour" in h for h in header):
-                    continue
+                has_header = any("identnummer" in h for h in header) and any("tour" in h for h in header)
 
-                def col_idx(*names):
-                    for i, h in enumerate(header):
-                        for n in names:
-                            if n in h:
-                                return i
-                    return None
+                if has_header and len(rows) >= 2:
+                    # Cazul normal: tabel cu header explicit, parsam rows[1:]
+                    def col_idx(*names):
+                        for i, h in enumerate(header):
+                            for n in names:
+                                if n in h:
+                                    return i
+                        return None
 
-                idx = {
-                    "ident": col_idx("identnummer"),
-                    "atg":   col_idx("atg"),
-                    "schad": col_idx("schadenart"),
-                    "tour":  col_idx("tour"),
-                    "name":  col_idx("name"),
-                    "str":   col_idx("strasse"),
-                    "plz":   col_idx("plz"),
-                    "ort":   col_idx("wohnort"),
-                    "datum": col_idx("datum"),
-                    "ford":  col_idx("forderung"),
-                }
+                    idx = {
+                        "ident": col_idx("identnummer"), "atg": col_idx("atg"),
+                        "schad": col_idx("schadenart"), "tour": col_idx("tour"),
+                        "name": col_idx("name"), "str": col_idx("strasse"),
+                        "plz": col_idx("plz"), "ort": col_idx("wohnort"),
+                        "datum": col_idx("datum"), "ford": col_idx("forderung"),
+                    }
+                    for row in rows[1:]:
+                        if not row or len(row) < 5:
+                            continue
+                        poz = extract_row_as_position(row, idx)
+                        if poz: result["pozitii"].append(poz)
 
-                for row in rows[1:]:
-                    if not row or len(row) < 5:
-                        continue
-
-                    def get(key):
-                        i = idx.get(key)
-                        if i is None or i >= len(row):
-                            return ""
-                        return (row[i] or "").strip()
-
-                    name = get("name").replace("\n", " ").strip()
-                    tour = get("tour").replace("\n", " ").strip()
-                    if not name and not tour:
-                        continue
-                    if "forderung gesamt" in get("ident").lower():
-                        continue
-
-                    result["pozitii"].append({
-                        "tour":       tour,
-                        "identnummer": get("ident").replace("\n", ""),
-                        "atg":        clean_atg(get("atg")),
-                        "schadenart": get("schad").replace("\n", " ").strip() or "Totalverlust",
-                        "name":       name,
-                        "strasse":    clean_strasse(get("str")),
-                        "plz":        get("plz"),
-                        "ort":        get("ort").replace("\n", " ").strip(),
-                        "datum":      get("datum"),
-                        "forderung":  parse_money(get("ford")),
-                    })
+                elif len(rows[0]) == 11:
+                    # Tabel FARA header — apare cand tabelul de pozitii se rupe intre
+                    # pagini si Hermes NU repeta header-ul pe pagina noua (doar randul
+                    # de date continua direct). Recunoastem dupa numarul de coloane
+                    # identic cu schema fixa Hermes (11) si folosim pozitii FIXE.
+                    idx_fixed = {k: i for i, k in enumerate(FIXED_SCHEMA)}
+                    for row in rows:
+                        if not row or len(row) < 5:
+                            continue
+                        poz = extract_row_as_position(row, idx_fixed)
+                        if poz: result["pozitii"].append(poz)
 
         def sort_key(p):
             try:

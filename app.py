@@ -8,7 +8,12 @@ Endpoints:
 """
 
 import io
+import os
 import re
+import hmac
+import hashlib
+import json
+from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import pdfplumber
@@ -18,6 +23,27 @@ from odf.text import P as OdfP
 
 app = Flask(__name__)
 CORS(app)
+
+# ── Firebase Admin SDK (pentru webhook-ul de import automat din email) ──
+# Necesita variabila de mediu FIREBASE_SERVICE_ACCOUNT_JSON pe Render
+# (continutul JSON al cheii de service account, descarcata din Firebase Console)
+_firebase_app = None
+_firestore_db = None
+
+def get_firestore():
+    global _firebase_app, _firestore_db
+    if _firestore_db is not None:
+        return _firestore_db
+    import firebase_admin
+    from firebase_admin import credentials, firestore
+    sa_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
+    if not sa_json:
+        raise RuntimeError("FIREBASE_SERVICE_ACCOUNT_JSON nu e setat pe server")
+    cred_dict = json.loads(sa_json)
+    cred = credentials.Certificate(cred_dict)
+    _firebase_app = firebase_admin.initialize_app(cred)
+    _firestore_db = firestore.client()
+    return _firestore_db
 
 
 # ══════════════════════════════════════════════════════
@@ -291,6 +317,125 @@ def parse_ods_reclamatii(file_bytes):
 # ROUTES
 # ══════════════════════════════════════════════════════
 
+
+# ══════════════════════════════════════════════════════════
+# PARSER: Sachverhalt PDF (Sendungsauskunft) — pentru import automat
+# Recunoaste toate 3 variantele de header Hermes: "Zustelladresse",
+# "Ablageort", "An Haushalt übergeben"
+# ══════════════════════════════════════════════════════════
+
+def parse_sachverhalt_pdf(file_bytes):
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        page = pdf.pages[0]
+        words = page.extract_words()
+
+    def at_top(top_val, xmin=None, xmax=None, tol=2):
+        m = [w for w in words if abs(w["top"] - top_val) <= tol]
+        if xmin is not None:
+            m = [w for w in m if w["x0"] >= xmin]
+        if xmax is not None:
+            m = [w for w in m if w["x0"] <= xmax]
+        return sorted(m, key=lambda w: w["x0"])
+
+    result = {}
+
+    ruck_word = next((w for w in words if w["text"] == "Rückinfo"), None)
+    if ruck_word:
+        result["ruckinfo"] = " ".join(w["text"] for w in at_top(ruck_word["top"], 200))
+
+    ag_word = next((w for w in words if w["text"] == "Auftraggeber"), None)
+    sid_word = next((w for w in words if w["text"] == "Sendungs-ID"), None)
+    if ag_word:
+        l1 = " ".join(w["text"] for w in at_top(ag_word["top"], 200, 600))
+        l2 = ""
+        if sid_word:
+            candidate_top = ag_word["top"] + 12
+            if candidate_top < sid_word["top"] - 2:
+                l2 = " ".join(w["text"] for w in at_top(candidate_top, 200, 600))
+        result["auftraggeber"] = (l1 + " " + l2).strip()
+
+    if sid_word:
+        result["sendungsId"] = " ".join(w["text"] for w in at_top(sid_word["top"], 200))
+
+    header_word = next((w for w in words if w["text"] in ("Zustelladresse", "Ablageort")), None)
+    if not header_word:
+        header_word = next((w for w in words if w["text"] == "übergeben"), None)
+
+    if header_word:
+        yh = header_word["top"]
+        xmin, xmax = 250, 420
+        quelle_word = next((w for w in words if w["text"].startswith("Quelle") and xmin <= w["x0"] <= 420 and w["top"] > yh), None)
+        y_bottom = quelle_word["top"] if quelle_word else yh + 60
+
+        row_tops = sorted(set(round(w["top"]) for w in words if xmin <= w["x0"] <= xmax and yh < w["top"] < y_bottom))
+        lines = []
+        for rt in row_tops:
+            text = " ".join(w["text"] for w in at_top(rt, xmin, xmax)).strip()
+            if text:
+                lines.append(text)
+
+        plz_idx = next((i for i, l in enumerate(lines) if re.match(r"^\d{5}\s+", l)), len(lines) - 1)
+        plz_line = lines[plz_idx] if plz_idx < len(lines) else ""
+        plz_m = re.match(r"^(\d{5})\s*(.+)", plz_line)
+        if plz_m:
+            result["plz"] = plz_m.group(1)
+            result["ort"] = plz_m.group(2)
+        result["name"] = lines[0] if lines else ""
+        candidate_lines = [l for l in lines[1:plz_idx] if not re.match(r"^\d+$", l.strip())]
+        result["strasse"] = candidate_lines[-1] if candidate_lines else ""
+
+        if result.get("name"):
+            parts = [p.strip() for p in result["name"].split(",")]
+            if len(parts) == 2:
+                result["nachname"] = parts[0]
+                result["vorname"] = parts[1]
+
+    datum_word = next((w for w in words if w["text"] == "Datum" and w["x0"] < 100), None)
+    if datum_word:
+        zug_word = next((w for w in words if "Zugestellt" in w["text"] and w["top"] > datum_word["top"]), None)
+        if zug_word:
+            yk = zug_word["top"]
+            result["deliveryDate"] = " ".join(w["text"] for w in at_top(yk, 50, 120))
+            result["tour"] = " ".join(w["text"] for w in at_top(yk, 500, 560)).strip()
+            time_row = at_top(yk - 10, 50, 120, 4)
+            if not time_row:
+                time_row = at_top(yk + 10, 50, 120, 4)
+            result["deliveryTime"] = " ".join(w["text"] for w in time_row)
+
+    return result
+
+
+def verify_mailgun_signature(token, timestamp, signature):
+    """Verifica semnatura Mailgun ca sa fim siguri ca request-ul chiar vine de la Mailgun."""
+    signing_key = os.environ.get("MAILGUN_SIGNING_KEY")
+    if not signing_key:
+        return False  # daca nu e configurat, refuzam din siguranta
+    hmac_digest = hmac.new(
+        key=signing_key.encode("utf-8"),
+        msg=(timestamp + token).encode("utf-8"),
+        digestmod=hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(hmac_digest, signature)
+
+
+def parse_de_date(date_str):
+    """Converteste 'DD.MM.YY' sau 'DD.MM.YYYY' in datetime."""
+    if not date_str:
+        return None
+    m = re.match(r"(\d{2})\.(\d{2})\.(\d{2,4})", date_str.strip())
+    if not m:
+        return None
+    d, mo, y = m.groups()
+    y = int(y)
+    if y < 100:
+        y += 2000
+    try:
+        return datetime(y, int(mo), int(d))
+    except ValueError:
+        return None
+
+
+
 @app.route("/")
 def home():
     return jsonify({
@@ -324,6 +469,108 @@ def parse_ods_endpoint():
         return jsonify(parse_ods_reclamatii(request.files["file"].read()))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/webhook-sachverhalt", methods=["POST"])
+def webhook_sachverhalt():
+    """
+    Endpoint apelat de Mailgun (Inbound Route) cand soseste un email nou
+    pe adresa dedicata (ex: sachverhalt@mtctransportgmbh.de).
+    Extrage automat PDF-urile Sachverhalt atasate, le parseaza si creeaza
+    reclamatii noi in Firestore, marcate 'sursaAutomata: true' pentru
+    verificare umana ulterioara (nu se salveaza orb, fara control).
+    """
+    try:
+        # Verificam semnatura Mailgun (securitate — evitam request-uri false)
+        token = request.form.get("token", "")
+        timestamp = request.form.get("timestamp", "")
+        signature = request.form.get("signature", "")
+        if not verify_mailgun_signature(token, timestamp, signature):
+            return jsonify({"error": "Semnatura invalida"}), 403
+
+        sender = request.form.get("sender", "necunoscut")
+        subject = request.form.get("subject", "")
+        attachment_count = int(request.form.get("attachment-count", 0))
+
+        db = get_firestore()
+        results = []
+
+        for i in range(1, attachment_count + 1):
+            file_key = f"attachment-{i}"
+            if file_key not in request.files:
+                continue
+            file = request.files[file_key]
+            filename = file.filename or ""
+            if not filename.lower().endswith(".pdf"):
+                continue
+            if "sachverhalt" not in filename.lower() and "sachverhalt" not in subject.lower():
+                continue  # sarim atasamente care nu par a fi Sachverhalt
+
+            file_bytes = file.read()
+            try:
+                parsed = parse_sachverhalt_pdf(file_bytes)
+            except Exception as e:
+                results.append({"filename": filename, "error": str(e)})
+                continue
+
+            sendungs_id = parsed.get("sendungsId", "")
+
+            # Deduplicare: daca exista deja o reclamatie cu acelasi numarPachet, sarim
+            if sendungs_id:
+                existing = db.collection("reclamatii").where("numarPachet", "==", sendungs_id).limit(1).get()
+                if len(existing) > 0:
+                    results.append({"filename": filename, "status": "duplicat", "sendungsId": sendungs_id})
+                    continue
+
+            # Cautam locatia dupa tura (daca soferul exista deja in baza)
+            tour = parsed.get("tour", "")
+            locatie = ""
+            if tour:
+                sofer_snap = db.collection("soferi").where("tura", "==", tour).limit(1).get()
+                if len(sofer_snap) > 0:
+                    locatie = sofer_snap[0].to_dict().get("locatie", "")
+
+            nume_client = f"{parsed.get('nachname','')} {parsed.get('vorname','')}".strip() or parsed.get("name", "")
+            data_livrare = parse_de_date(parsed.get("deliveryDate"))
+            termin = parse_de_date((parsed.get("ruckinfo") or "").split(" ")[0] if parsed.get("ruckinfo") else None)
+
+            doc = {
+                "numeClient": nume_client,
+                "vorname": parsed.get("vorname", ""),
+                "nachname": parsed.get("nachname", ""),
+                "strada": parsed.get("strasse", ""),
+                "plz": parsed.get("plz", ""),
+                "ort": parsed.get("ort", ""),
+                "turaSofer": tour,
+                "locatie": locatie,
+                "numarPachet": sendungs_id,
+                "numePachet": parsed.get("auftraggeber", ""),
+                "dataReclamatie": data_livrare if data_livrare else datetime.now(timezone.utc),
+                "termin": termin,
+                "status": "neprelucrat",
+                "tipReclamatie": "livrare",
+                "adaugatDe": "auto-email",
+                "adaugatDeNume": "⚡ Import automat (email)",
+                "sursaAutomata": True,
+                "verificatDeOm": False,
+                "emailSender": sender,
+                "emailSubject": subject,
+                "createdAt": firestore_server_timestamp(),
+                "updatedAt": firestore_server_timestamp(),
+            }
+            db.collection("reclamatii").add(doc)
+            results.append({"filename": filename, "status": "adaugat", "sendungsId": sendungs_id, "nume": nume_client})
+
+        return jsonify({"ok": True, "processed": results})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+def firestore_server_timestamp():
+    from firebase_admin import firestore
+    return firestore.SERVER_TIMESTAMP
+
 
 
 if __name__ == "__main__":

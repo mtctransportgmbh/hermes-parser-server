@@ -532,7 +532,18 @@ def webhook_sachverhalt():
 
             nume_client = f"{parsed.get('nachname','')} {parsed.get('vorname','')}".strip() or parsed.get("name", "")
             data_livrare = parse_de_date(parsed.get("deliveryDate"))
-            termin = parse_de_date((parsed.get("ruckinfo") or "").split(" ")[0] if parsed.get("ruckinfo") else None)
+            termin_dt = parse_de_date((parsed.get("ruckinfo") or "").split(" ")[0] if parsed.get("ruckinfo") else None)
+            # Aplicatia asteapta termin ca STRING 'YYYY-MM-DD' (format nativ <input type="date">),
+            # NU ca obiect datetime/Timestamp — spre deosebire de dataReclamatie
+            termin_str = termin_dt.strftime("%Y-%m-%d") if termin_dt else ""
+
+            # Descriere auto-generata cu context util pentru trasabilitate
+            descriere_parts = [f"⚡ Import automat din email ({sender})"]
+            if subject:
+                descriere_parts.append(f"Subiect: {subject}")
+            if parsed.get("ruckinfo"):
+                descriere_parts.append(f"Rückinfo bis: {parsed.get('ruckinfo')}")
+            descriere = " · ".join(descriere_parts)
 
             doc = {
                 "numeClient": nume_client,
@@ -546,7 +557,8 @@ def webhook_sachverhalt():
                 "numarPachet": sendungs_id,
                 "numePachet": parsed.get("auftraggeber", ""),
                 "dataReclamatie": data_livrare if data_livrare else datetime.now(timezone.utc),
-                "termin": termin,
+                "termin": termin_str,
+                "descriere": descriere,
                 "status": "neprelucrat",
                 "tipReclamatie": "livrare",
                 "adaugatDe": "auto-email",

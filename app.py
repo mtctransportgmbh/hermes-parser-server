@@ -503,16 +503,14 @@ def webhook_sachverhalt():
             filename = file.filename or ""
             if not filename.lower().endswith(".pdf"):
                 continue
-            # Verificam dupa AMBELE cuvinte posibile — subiectul real Hermes
-            # contine de obicei "Sendungsauskunft", nu neaparat "Sachverhalt"
+            # IMPORTANT: verificam STRICT numele fisierului atasat (nu subiectul
+            # email-ului), pentru ca un singur email poate contine MAI MULTE PDF-uri
+            # diferite (ex: Sachverhalt + Ablieferungsnachweis). Daca am verifica dupa
+            # subiect, am importa gresit si celelalte atasamente irelevante.
             filename_l = filename.lower()
-            subject_l = subject.lower()
-            is_sachverhalt = (
-                "sachverhalt" in filename_l or "sachverhalt" in subject_l or
-                "sendungsauskunft" in filename_l or "sendungsauskunft" in subject_l
-            )
+            is_sachverhalt = "sachverhalt" in filename_l or "sendungsauskunft" in filename_l
             if not is_sachverhalt:
-                continue  # sarim atasamente care nu par a fi Sachverhalt/Sendungsauskunft
+                continue  # sarim atasamente care nu sunt Sachverhalt (ex: Ablieferungsnachweis)
 
             file_bytes = file.read()
             try:

@@ -503,8 +503,16 @@ def webhook_sachverhalt():
             filename = file.filename or ""
             if not filename.lower().endswith(".pdf"):
                 continue
-            if "sachverhalt" not in filename.lower() and "sachverhalt" not in subject.lower():
-                continue  # sarim atasamente care nu par a fi Sachverhalt
+            # Verificam dupa AMBELE cuvinte posibile — subiectul real Hermes
+            # contine de obicei "Sendungsauskunft", nu neaparat "Sachverhalt"
+            filename_l = filename.lower()
+            subject_l = subject.lower()
+            is_sachverhalt = (
+                "sachverhalt" in filename_l or "sachverhalt" in subject_l or
+                "sendungsauskunft" in filename_l or "sendungsauskunft" in subject_l
+            )
+            if not is_sachverhalt:
+                continue  # sarim atasamente care nu par a fi Sachverhalt/Sendungsauskunft
 
             file_bytes = file.read()
             try:

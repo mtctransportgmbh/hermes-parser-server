@@ -397,6 +397,8 @@ def parse_sachverhalt_pdf(file_bytes):
             yk = zug_word["top"]
             result["deliveryDate"] = " ".join(w["text"] for w in at_top(yk, 50, 120))
             result["tour"] = " ".join(w["text"] for w in at_top(yk, 500, 560)).strip()
+            # Coloana Status (ex: "Zugestellt Medea") — intre Ort si Datum, x aprox 230-420
+            result["deliveryStatus"] = " ".join(w["text"] for w in at_top(yk, 230, 420)).strip()
             time_row = at_top(yk - 10, 50, 120, 4)
             if not time_row:
                 time_row = at_top(yk + 10, 50, 120, 4)
@@ -549,6 +551,9 @@ def webhook_sachverhalt():
                 descriere_parts.append(f"Subiect: {subject}")
             if parsed.get("ruckinfo"):
                 descriere_parts.append(f"Rückinfo bis: {parsed.get('ruckinfo')}")
+            if parsed.get("deliveryStatus") and parsed.get("deliveryDate"):
+                deliv_time_part = f" {parsed.get('deliveryTime')}" if parsed.get("deliveryTime") else ""
+                descriere_parts.append(f"{parsed.get('deliveryStatus')} · Livrat: {parsed.get('deliveryDate')}{deliv_time_part}")
             descriere = " · ".join(descriere_parts)
 
             doc = {

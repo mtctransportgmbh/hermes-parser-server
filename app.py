@@ -328,6 +328,12 @@ def parse_sachverhalt_pdf(file_bytes):
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         page = pdf.pages[0]
         words = page.extract_words()
+        # Cuvintele de pe TOATE paginile — necesar pentru tabelul de tracking,
+        # care se poate intinde pe 2+ pagini (mai ales cand sunt multiple
+        # tentative esuate "Rücklauf nicht Angetroffen" inainte de livrarea reala)
+        all_pages_words = []
+        for p in pdf.pages:
+            all_pages_words.append(p.extract_words())
 
     def at_top(top_val, xmin=None, xmax=None, tol=2):
         m = [w for w in words if abs(w["top"] - top_val) <= tol]
@@ -390,19 +396,31 @@ def parse_sachverhalt_pdf(file_bytes):
                 result["nachname"] = parts[0]
                 result["vorname"] = parts[1]
 
-    datum_word = next((w for w in words if w["text"] == "Datum" and w["x0"] < 100), None)
-    if datum_word:
-        zug_word = next((w for w in words if "Zugestellt" in w["text"] and w["top"] > datum_word["top"]), None)
+    # Cautam textul "Zugestellt" (livrare reusita) pe TOATE paginile, nu doar prima —
+    # tabelul de tracking poate contine multe tentative esuate ("Rücklauf nicht
+    # Angetroffen") inainte de livrarea reala, si acestea pot depasi o pagina.
+    # Parcurgem paginile in ordine si folosim PRIMA aparitie gasita (evenimentele
+    # sunt cronologice, iar Hermes scrie "Zugestellt" doar la livrarea efectiva).
+    for page_words in all_pages_words:
+        def at_top_page(top_val, xmin=None, xmax=None, tol=2, _words=page_words):
+            m = [w for w in _words if abs(w["top"] - top_val) <= tol]
+            if xmin is not None:
+                m = [w for w in m if w["x0"] >= xmin]
+            if xmax is not None:
+                m = [w for w in m if w["x0"] <= xmax]
+            return sorted(m, key=lambda w: w["x0"])
+
+        zug_word = next((w for w in page_words if "Zugestellt" in w["text"]), None)
         if zug_word:
             yk = zug_word["top"]
-            result["deliveryDate"] = " ".join(w["text"] for w in at_top(yk, 50, 120))
-            result["tour"] = " ".join(w["text"] for w in at_top(yk, 500, 560)).strip()
-            # Coloana Status (ex: "Zugestellt Medea") — intre Ort si Datum, x aprox 230-420
-            result["deliveryStatus"] = " ".join(w["text"] for w in at_top(yk, 230, 420)).strip()
-            time_row = at_top(yk - 10, 50, 120, 4)
+            result["deliveryDate"] = " ".join(w["text"] for w in at_top_page(yk, 50, 120))
+            result["tour"] = " ".join(w["text"] for w in at_top_page(yk, 500, 560)).strip()
+            result["deliveryStatus"] = " ".join(w["text"] for w in at_top_page(yk, 230, 420)).strip()
+            time_row = at_top_page(yk - 10, 50, 120, 4)
             if not time_row:
-                time_row = at_top(yk + 10, 50, 120, 4)
+                time_row = at_top_page(yk + 10, 50, 120, 4)
             result["deliveryTime"] = " ".join(w["text"] for w in time_row)
+            break  # gasit — nu mai cautam pe alte pagini
 
     return result
 

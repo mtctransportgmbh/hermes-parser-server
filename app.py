@@ -13,7 +13,7 @@ import re
 import hmac
 import hashlib
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import pdfplumber
@@ -587,10 +587,10 @@ def webhook_sachverhalt():
 
             nume_client = f"{parsed.get('nachname','')} {parsed.get('vorname','')}".strip() or parsed.get("name", "")
             data_livrare = parse_de_date(parsed.get("deliveryDate"))
-            termin_dt = parse_de_date((parsed.get("ruckinfo") or "").split(" ")[0] if parsed.get("ruckinfo") else None)
-            # Aplicatia asteapta termin ca STRING 'YYYY-MM-DD' (format nativ <input type="date">),
-            # NU ca obiect datetime/Timestamp — spre deosebire de dataReclamatie
-            termin_str = termin_dt.strftime("%Y-%m-%d") if termin_dt else ""
+            # Termin NU se mai ia din PDF (Rückinfo bis) — se calculeaza automat:
+            # data la care reclamatia intra in sistemul nostru + 4 zile (pana la 23:59 acea zi)
+            termin_dt = datetime.now() + timedelta(days=4)
+            termin_str = termin_dt.strftime("%Y-%m-%d")
 
             # Descriere auto-generata cu context util pentru trasabilitate
             descriere_parts = [f"⚡ Import automat din email ({sender})"]

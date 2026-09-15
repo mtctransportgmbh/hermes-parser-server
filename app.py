@@ -363,32 +363,61 @@ def parse_sachverhalt_pdf(file_bytes):
     if sid_word:
         result["sendungsId"] = " ".join(w["text"] for w in at_top(sid_word["top"], 200))
 
-    header_word = next((w for w in words if w["text"] in ("Zustelladresse", "Ablageort")), None)
-    if not header_word:
-        header_word = next((w for w in words if w["text"] == "übergeben"), None)
-
-    if header_word:
-        yh = header_word["top"]
-        xmin, xmax = 250, 420
-        quelle_word = next((w for w in words if w["text"].startswith("Quelle") and xmin <= w["x0"] <= 420 and w["top"] > yh), None)
-        y_bottom = quelle_word["top"] if quelle_word else yh + 60
-
+    def extract_address_block(xmin, xmax, yh, y_bottom):
+        """Extrage nume/strada/plz/ort dintr-o coloana de adresa (stanga=originala, dreapta=livrare)."""
         row_tops = sorted(set(round(w["top"]) for w in words if xmin <= w["x0"] <= xmax and yh < w["top"] < y_bottom))
         lines = []
         for rt in row_tops:
             text = " ".join(w["text"] for w in at_top(rt, xmin, xmax)).strip()
             if text:
                 lines.append(text)
-
         plz_idx = next((i for i, l in enumerate(lines) if re.match(r"^\d{5}\s+", l)), len(lines) - 1)
         plz_line = lines[plz_idx] if plz_idx < len(lines) else ""
         plz_m = re.match(r"^(\d{5})\s*(.+)", plz_line)
-        if plz_m:
-            result["plz"] = plz_m.group(1)
-            result["ort"] = plz_m.group(2)
-        result["name"] = lines[0] if lines else ""
+        plz = plz_m.group(1) if plz_m else ""
+        ort = plz_m.group(2) if plz_m else ""
+        name = lines[0] if lines else ""
         candidate_lines = [l for l in lines[1:plz_idx] if not re.match(r"^\d+$", l.strip())]
-        result["strasse"] = candidate_lines[-1] if candidate_lines else ""
+        strasse = candidate_lines[-1] if candidate_lines else ""
+        return {"name": name, "strasse": strasse, "plz": plz, "ort": ort}
+
+    def normalize_strada(s):
+        """Normalizeaza prescurtari (Straße/Strasse/Str./Str -> str) pentru comparatie corecta."""
+        if not s:
+            return ""
+        s = s.lower()
+        s = re.sub(r"stra(ss|ß)e", "str", s)
+        s = re.sub(r"str\.", "str", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    header_word = next((w for w in words if w["text"] in ("Zustelladresse", "Ablageort")), None)
+    if not header_word:
+        header_word = next((w for w in words if w["text"] == "übergeben"), None)
+
+    if header_word:
+        yh = header_word["top"]
+        quelle_word = next((w for w in words if w["text"].startswith("Quelle") and 250 <= w["x0"] <= 420 and w["top"] > yh), None)
+        y_bottom = quelle_word["top"] if quelle_word else yh + 60
+
+        deliv = extract_address_block(250, 420, yh, y_bottom)
+        result["name"] = deliv["name"]
+        result["strasse"] = deliv["strasse"]
+        result["plz"] = deliv["plz"]
+        result["ort"] = deliv["ort"]
+
+        # Adresa ORIGINALA (unde trebuia livrat pachetul) — coloana din stanga,
+        # aceleasi limite verticale (yh/y_bottom) ca si adresa de livrare
+        orig = extract_address_block(50, 230, yh, y_bottom)
+        result["origStrasse"] = orig["strasse"]
+        result["origPlz"] = orig["plz"]
+        result["origOrt"] = orig["ort"]
+
+        # Comparam adresele NORMALIZATE — daca strada difera dupa normalizare
+        # (nu doar o prescurtare diferita a aceleiasi strazi), semnalam alerta
+        norm_orig = normalize_strada(orig["strasse"])
+        norm_deliv = normalize_strada(deliv["strasse"])
+        result["adresaLivrareDiferita"] = bool(norm_orig and norm_deliv and norm_orig != norm_deliv)
 
         if result.get("name"):
             parts = [p.strip() for p in result["name"].split(",")]
@@ -572,6 +601,13 @@ def webhook_sachverhalt():
             if parsed.get("deliveryStatus") and parsed.get("deliveryDate"):
                 deliv_time_part = f" {parsed.get('deliveryTime')}" if parsed.get("deliveryTime") else ""
                 descriere_parts.append(f"{parsed.get('deliveryStatus')} · Livrat: {parsed.get('deliveryDate')}{deliv_time_part}")
+
+            adresa_diferita = parsed.get("adresaLivrareDiferita", False)
+            if adresa_diferita:
+                orig_full = f"{parsed.get('origStrasse','')}, {parsed.get('origPlz','')} {parsed.get('origOrt','')}".strip(", ")
+                deliv_full = f"{parsed.get('strasse','')}, {parsed.get('plz','')} {parsed.get('ort','')}".strip(", ")
+                descriere_parts.append(f"⚠️ PACHET LIVRAT LA ALTĂ ADRESĂ! Original: {orig_full} · Livrat efectiv: {deliv_full}")
+
             descriere = " · ".join(descriere_parts)
 
             doc = {
@@ -581,6 +617,10 @@ def webhook_sachverhalt():
                 "strada": parsed.get("strasse", ""),
                 "plz": parsed.get("plz", ""),
                 "ort": parsed.get("ort", ""),
+                "origStrada": parsed.get("origStrasse", ""),
+                "origPlz": parsed.get("origPlz", ""),
+                "origOrt": parsed.get("origOrt", ""),
+                "adresaLivrareDiferita": adresa_diferita,
                 "turaSofer": tour,
                 "locatie": locatie,
                 "numarPachet": sendungs_id,
@@ -589,7 +629,7 @@ def webhook_sachverhalt():
                 "termin": termin_str,
                 "descriere": descriere,
                 "status": "neprelucrat",
-                "tipReclamatie": "livrare",
+                "tipReclamatie": "livrare" if not adresa_diferita else "adresa gresita",
                 "adaugatDe": "auto-email",
                 "adaugatDeNume": "⚡ Import automat (email)",
                 "sursaAutomata": True,

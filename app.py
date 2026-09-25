@@ -395,6 +395,10 @@ def parse_sachverhalt_pdf(file_bytes):
     if not header_word:
         header_word = next((w for w in words if w["text"] == "übergeben"), None)
 
+    # "Ablageort" = pachetul a fost lasat la un loc de depozitare stabilit prin
+    # acord (nu predat direct), spre deosebire de "Zustelladresse"/"übergeben"
+    result["esteAblageort"] = bool(header_word and header_word["text"] == "Ablageort")
+
     if header_word:
         yh = header_word["top"]
         quelle_word = next((w for w in words if w["text"].startswith("Quelle") and 250 <= w["x0"] <= 420 and w["top"] > yh), None)
@@ -608,6 +612,10 @@ def webhook_sachverhalt():
                 deliv_full = f"{parsed.get('strasse','')}, {parsed.get('plz','')} {parsed.get('ort','')}".strip(", ")
                 descriere_parts.append(f"⚠️ PACHET LIVRAT LA ALTĂ ADRESĂ! Original: {orig_full} · Livrat efectiv: {deliv_full}")
 
+            este_ablageort = parsed.get("esteAblageort", False)
+            if este_ablageort:
+                descriere_parts.append("⚠️ ACORD DE OPRIRE — pachetul a fost lăsat la locul de depozitare stabilit (Ablageort), nu predat direct")
+
             descriere = " · ".join(descriere_parts)
 
             doc = {
@@ -621,6 +629,7 @@ def webhook_sachverhalt():
                 "origPlz": parsed.get("origPlz", ""),
                 "origOrt": parsed.get("origOrt", ""),
                 "adresaLivrareDiferita": adresa_diferita,
+                "esteAblageort": este_ablageort,
                 "turaSofer": tour,
                 "locatie": locatie,
                 "numarPachet": sendungs_id,

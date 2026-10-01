@@ -662,6 +662,217 @@ def firestore_server_timestamp():
     return firestore.SERVER_TIMESTAMP
 
 
+# ══════════════════════════════════════════════════════
+# AUTENTIFICARE PIN — verificare 100% server-side.
+#
+# De ce: inainte, PIN-ul era comparat direct in JS-ul din browser impotriva
+# unui hash stocat in Firestore, iar regulile Firestore erau complet publice
+# ("allow read, write: if true"). Asta insemna ca oricine gasea adresa
+# aplicatiei putea citi/scrie toata baza de date DIRECT, ocolind complet
+# ecranul de PIN. Acum:
+#   1. PIN-ul (6 cifre) e trimis aici, la server, NICIODATA comparat in JS
+#   2. Contorizam incercarile gresite in Firestore (rezista si la restart
+#      de server) si blocam userul 60s dupa 5 esecuri consecutive
+#   3. Daca PIN-ul e corect, emitem un "custom token" Firebase pentru
+#      exact acel user — clientul se autentifica REAL cu el
+#   4. Regulile Firestore (separat, in consola) vor cere request.auth != null,
+#      deci cineva fara sa treaca pe aici nu mai poate atinge baza de date
+# ══════════════════════════════════════════════════════
+
+PIN_SALT_SECRET = os.environ.get("PIN_SALT_SECRET", "")
+PIN_MAX_ATTEMPTS = 3
+PIN_LOCKOUT_SECONDS = 300
+ADMIN_UID = "itgIGVH3Y2ZaGCSwJa7yt7Nd14R2"
+
+
+def hash_pin_server(pin, user_id):
+    """Hash SHA-256 cu salt secret (server-only) — nu mai poate fi reprodus din JS client."""
+    if not PIN_SALT_SECRET:
+        raise RuntimeError("PIN_SALT_SECRET nu e setat pe server")
+    payload = f"{PIN_SALT_SECRET}:{user_id}:{pin}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def get_user_doc_ref_and_data(db, user_id):
+    ref = db.collection("users").document(user_id)
+    snap = ref.get()
+    return ref, (snap.to_dict() if snap.exists else {})
+
+
+def is_valid_pin_format(pin):
+    return bool(re.match(r"^\d{6}$", pin or ""))
+
+
+def check_and_get_lockout_seconds(udata):
+    """Intoarce cate secunde mai sunt de asteptat daca userul e blocat, altfel 0."""
+    locked_until = udata.get("pinLockedUntil")
+    if not locked_until:
+        return 0
+    # Firestore intoarce un obiect datetime (cu tz) pentru campurile de tip Timestamp
+    try:
+        now = datetime.now(timezone.utc)
+        locked_dt = locked_until if locked_until.tzinfo else locked_until.replace(tzinfo=timezone.utc)
+        remaining = (locked_dt - now).total_seconds()
+        return max(0, int(remaining))
+    except Exception:
+        return 0
+
+
+@app.route("/auth/login-pin", methods=["POST"])
+def auth_login_pin():
+    """Verifica PIN-ul unui user si, daca e corect, emite un custom token Firebase."""
+    data = request.get_json(silent=True) or {}
+    user_id = (data.get("userId") or "").strip()
+    pin = (data.get("pin") or "").strip()
+    if not user_id or not is_valid_pin_format(pin):
+        return jsonify({"error": "invalid_request"}), 400
+
+    try:
+        db = get_firestore()
+    except Exception as e:
+        return jsonify({"error": "server_config", "detail": str(e)}), 500
+
+    ref, udata = get_user_doc_ref_and_data(db, user_id)
+
+    lock_remaining = check_and_get_lockout_seconds(udata)
+    if lock_remaining > 0:
+        return jsonify({"error": "locked", "retryAfterSeconds": lock_remaining}), 423
+
+    stored_hash = udata.get("pinHashV2")
+    if not stored_hash:
+        return jsonify({"error": "no_pin_set"}), 404
+
+    try:
+        hashed = hash_pin_server(pin, user_id)
+    except RuntimeError as e:
+        return jsonify({"error": "server_config", "detail": str(e)}), 500
+
+    if not hmac.compare_digest(hashed, stored_hash):
+        fail_count = int(udata.get("pinFailCount", 0)) + 1
+        update = {"pinFailCount": fail_count}
+        locked = fail_count >= PIN_MAX_ATTEMPTS
+        if locked:
+            update["pinLockedUntil"] = datetime.now(timezone.utc) + timedelta(seconds=PIN_LOCKOUT_SECONDS)
+            update["pinFailCount"] = 0
+        ref.set(update, merge=True)
+        if locked:
+            return jsonify({"error": "locked", "retryAfterSeconds": PIN_LOCKOUT_SECONDS}), 423
+        return jsonify({"error": "wrong_pin", "attemptsLeft": PIN_MAX_ATTEMPTS - fail_count}), 401
+
+    # PIN corect — resetam contorul de esecuri si emitem custom token
+    from firebase_admin import auth as fb_auth, firestore as fb_firestore
+    ref.set({
+        "pinFailCount": 0,
+        "pinLockedUntil": fb_firestore.DELETE_FIELD,
+        "lastLogin": fb_firestore.SERVER_TIMESTAMP,
+    }, merge=True)
+    token = fb_auth.create_custom_token(user_id)
+    return jsonify({"token": token.decode("utf-8") if isinstance(token, bytes) else token})
+
+
+@app.route("/auth/setup-pin", methods=["POST"])
+def auth_setup_pin():
+    """Prima setare a PIN-ului pentru un user (nu exista deja unul salvat)."""
+    data = request.get_json(silent=True) or {}
+    user_id = (data.get("userId") or "").strip()
+    pin = (data.get("pin") or "").strip()
+    if not user_id or not is_valid_pin_format(pin):
+        return jsonify({"error": "invalid_request"}), 400
+
+    try:
+        db = get_firestore()
+    except Exception as e:
+        return jsonify({"error": "server_config", "detail": str(e)}), 500
+
+    ref, udata = get_user_doc_ref_and_data(db, user_id)
+    if udata.get("pinHashV2"):
+        return jsonify({"error": "pin_already_set"}), 409
+
+    try:
+        hashed = hash_pin_server(pin, user_id)
+    except RuntimeError as e:
+        return jsonify({"error": "server_config", "detail": str(e)}), 500
+
+    from firebase_admin import auth as fb_auth, firestore as fb_firestore
+    ref.set({
+        "pinHashV2": hashed,
+        "pin": pin,  # pastram PIN-ul in clar DOAR pentru afisare admin (ca si pana acum)
+        "pinSetAt": datetime.now(timezone.utc).isoformat(),
+        "pinFailCount": 0,
+        "pinLockedUntil": fb_firestore.DELETE_FIELD,
+        "lastLogin": fb_firestore.SERVER_TIMESTAMP,
+    }, merge=True)
+    token = fb_auth.create_custom_token(user_id)
+    return jsonify({"token": token.decode("utf-8") if isinstance(token, bytes) else token})
+
+
+def verify_admin_bearer_token():
+    """Verifica headerul Authorization: Bearer <idToken Firebase> si confirma ca e Admin."""
+    authz = request.headers.get("Authorization", "")
+    if not authz.startswith("Bearer "):
+        return None
+    id_token = authz[7:].strip()
+    from firebase_admin import auth as fb_auth
+    try:
+        decoded = fb_auth.verify_id_token(id_token)
+        return decoded
+    except Exception:
+        return None
+
+
+@app.route("/auth/admin-set-pin", methods=["POST"])
+def auth_admin_set_pin():
+    """Admin seteaza/schimba direct PIN-ul altui user (sau al sau propriu)."""
+    decoded = verify_admin_bearer_token()
+    if not decoded or decoded.get("uid") != ADMIN_UID:
+        return jsonify({"error": "forbidden"}), 403
+
+    data = request.get_json(silent=True) or {}
+    target_user_id = (data.get("targetUserId") or "").strip()
+    new_pin = (data.get("newPin") or "").strip()
+    if not target_user_id or not is_valid_pin_format(new_pin):
+        return jsonify({"error": "invalid_request"}), 400
+
+    try:
+        db = get_firestore()
+        hashed = hash_pin_server(new_pin, target_user_id)
+    except Exception as e:
+        return jsonify({"error": "server_config", "detail": str(e)}), 500
+
+    from firebase_admin import firestore as fb_firestore
+    db.collection("users").document(target_user_id).set({
+        "pinHashV2": hashed,
+        "pin": new_pin,
+        "pinSetAt": datetime.now(timezone.utc).isoformat(),
+        "pinFailCount": 0,
+        "pinLockedUntil": fb_firestore.DELETE_FIELD,
+    }, merge=True)
+    return jsonify({"ok": True})
+
+
+@app.route("/auth/admin-reset-pin", methods=["POST"])
+def auth_admin_reset_pin():
+    """Admin sterge PIN-ul unui user — la urmatoarea logare i se va cere sa seteze unul nou."""
+    decoded = verify_admin_bearer_token()
+    if not decoded or decoded.get("uid") != ADMIN_UID:
+        return jsonify({"error": "forbidden"}), 403
+
+    data = request.get_json(silent=True) or {}
+    target_user_id = (data.get("targetUserId") or "").strip()
+    if not target_user_id:
+        return jsonify({"error": "invalid_request"}), 400
+
+    db = get_firestore()
+    from firebase_admin import firestore as fb_firestore
+    db.collection("users").document(target_user_id).set({
+        "pinHashV2": fb_firestore.DELETE_FIELD,
+        "pin": fb_firestore.DELETE_FIELD,
+        "pinFailCount": 0,
+        "pinLockedUntil": fb_firestore.DELETE_FIELD,
+        "pinResetRequired": True,
+    }, merge=True)
+    return jsonify({"ok": True})
+
 
 if __name__ == "__main__":
     import os

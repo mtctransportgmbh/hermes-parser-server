@@ -458,6 +458,107 @@ def parse_sachverhalt_pdf(file_bytes):
     return result
 
 
+def _fix_squished_spacing(s):
+    """pdfplumber lipeste uneori cuvinte alaturate fara spatiu intre ele
+    (coloane apropiate vizual). Reintroducem spatiul acolo unde e clar un
+    nume nou incepe (graniță minuscula->majuscula), ex: 'MoritzGammel' ->
+    'Moritz Gammel'."""
+    if not s:
+        return s
+    return re.sub(r"([a-zà-öø-ÿ])([A-ZÀ-ÖØ-Ý])", r"\1 \2", s)
+
+
+def parse_sachverhalt_dpd_pdf(file_bytes):
+    """
+    Parseaza PDF-ul "Paketdaten" (Sachverhalt) de la curierul DPD — format
+    diferit de cel Hermes (parse_sachverhalt_pdf de mai sus), cu propriile
+    sectiuni: LIEFERADRESSE (adresa reala de livrare), AUFTRAGSDATEN, si
+    PAKETLEBENSLAUF (istoricul livrarii, unde gasim linia "Zustellung an:
+    <Nume> ... Tour: <numar>" cu data/ora pe doua randuri consecutive).
+    Folosit DOAR pentru spatiul Corinei — nu afecteaza fluxul Hermes existent.
+    """
+    result = {"numeClient": "", "strada": "", "plz": "", "oras": "", "tour": "", "dataOraLivrare": "", "numarPachet": ""}
+
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        full_text = "\n".join(p.extract_text() or "" for p in pdf.pages)
+
+    lines = [l.strip() for l in full_text.split("\n") if l.strip()]
+
+    # ── Numarul de urmarire al pachetului — mereu din "VerknüpftePakete" ──
+    # (e acelasi numar care apare si langa "Paketdaten" in capul paginii, dar
+    # "VerknüpftePakete" e eticheta oficiala si stabila in AUFTRAGSDATEN)
+    for l in lines:
+        m = re.match(r"^Verkn[uü]pftePakete\s+(.+)$", l)
+        if m:
+            result["numarPachet"] = m.group(1).split(";")[0].strip()
+            break
+
+    # ── Blocul LIEFERADRESSE (adresa unde a fost livrat efectiv pachetul) ──
+    lief_idx = next((i for i, l in enumerate(lines) if "LIEFERADRESSE" in l), None)
+    if lief_idx is not None:
+        end_idx = next((j for j in range(lief_idx + 1, len(lines)) if "AUFTRAGSDATEN" in lines[j]), None)
+        block = lines[lief_idx + 1 : end_idx] if end_idx else lines[lief_idx + 1 : lief_idx + 8]
+        cleaned = []
+        for b in block:
+            if b.startswith("Tel.:"):
+                continue
+            # linia poate avea lipit la inceput finalul coloanei din stanga (un email) —
+            # il eliminam, nu aruncam toata linia, ca sa nu pierdem numele de dupa el
+            b2 = re.sub(r"[\w.+-]+@[\w.-]+", "", b).strip()
+            if b2:
+                cleaned.append(b2)
+        block = cleaned
+
+        de_idx, plz, oras = None, "", ""
+        for k, b in enumerate(block):
+            m = re.match(r"^DE-(\d{5})(.+)$", b)
+            if m:
+                de_idx = k
+                plz = m.group(1)
+                oras = m.group(2).replace(",", ", ").strip()
+                break
+
+        nume = block[0] if block else ""
+        strada = ""
+        if de_idx is not None and de_idx > 0:
+            strada = block[de_idx - 1]
+        elif len(block) > 1:
+            strada = block[1]
+        # reintroducem spatiul dintre numele strazii si numar (ex: "Kolumbusstr.16" -> "Kolumbusstr. 16")
+        strada = re.sub(r"([^\d\s])(\d+)$", r"\1 \2", strada)
+
+        result["numeClient"] = _fix_squished_spacing(nume)
+        result["strada"] = _fix_squished_spacing(strada)
+        result["plz"] = plz
+        result["oras"] = _fix_squished_spacing(oras)
+
+    # ── Tour-ul si data/ora livrarii efective, din PAKETLEBENSLAUF ──
+    # Linia arata asa (pe 2 randuri, din cauza impachetarii coloanelor):
+    #   "15.09.2026 0010180Neufahrn(DE) Zustellungan:MoritzGammel DE-80636-0010280Tour:"
+    #   "18:05Uhr 501-Service:327"
+    # Daca exista mai multe tentative de livrare, pastram ULTIMA aparitie (livrarea finala).
+    for i, l in enumerate(lines):
+        if "Zustellungan:" not in l.replace(" ", ""):
+            continue
+        date_m = re.match(r"^(\d{2}\.\d{2}\.\d{4})", l)
+        date_str = date_m.group(1) if date_m else ""
+        tour, time_str = "", ""
+        if i + 1 < len(lines):
+            nxt = lines[i + 1]
+            time_m = re.match(r"^(\d{2}:\d{2})Uhr", nxt)
+            if time_m:
+                time_str = time_m.group(1)
+            tour_m = re.search(r"(\d{2,4})-Service", nxt)
+            if tour_m:
+                tour = tour_m.group(1)
+        if date_str:
+            result["dataOraLivrare"] = f"{date_str} {time_str}".strip()
+        if tour:
+            result["tour"] = tour
+
+    return result
+
+
 def verify_mailgun_signature(token, timestamp, signature):
     """Verifica semnatura Mailgun ca sa fim siguri ca request-ul chiar vine de la Mailgun."""
     signing_key = os.environ.get("MAILGUN_SIGNING_KEY")
@@ -520,6 +621,22 @@ def parse_ods_endpoint():
         return jsonify({"error": "Lipsește cheia 'file'"}), 400
     try:
         return jsonify(parse_ods_reclamatii(request.files["file"].read()))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/parse-sachverhalt-dpd", methods=["POST"])
+def parse_sachverhalt_dpd_endpoint():
+    """Parseaza un PDF Sachverhalt DPD ('Paketdaten ...') — folosit de spațiul
+    Corinei pentru a completa automat nume/adresă/tour/dată livrare la adăugarea
+    unei reclamații noi. Suma rămâne mereu introdusă manual (nu e în acest PDF)."""
+    if "file" not in request.files:
+        return jsonify({"error": "Lipsește cheia 'file'"}), 400
+    f = request.files["file"]
+    if not f.filename.lower().endswith(".pdf"):
+        return jsonify({"error": "Fișierul trebuie să fie PDF"}), 400
+    try:
+        return jsonify(parse_sachverhalt_dpd_pdf(f.read()))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

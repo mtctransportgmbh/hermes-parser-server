@@ -924,17 +924,29 @@ def auth_setup_pin():
 
 
 def verify_admin_bearer_token():
-    """Verifica headerul Authorization: Bearer <idToken Firebase> si confirma ca e Admin."""
+    """Verifica headerul Authorization: Bearer <idToken Firebase> si intoarce token-ul decodat.
+
+    Tolereaza mici diferente de ceas (60s) intre serverul Render si Google, care altfel
+    dau "Token used too early" si resping un token perfect valid. Daca esueaza, motivul
+    ramane in `verify_admin_bearer_token.last_error` (apare in raspunsul 403, ca sa
+    se vada in consola browserului DE CE a fost refuzat)."""
+    verify_admin_bearer_token.last_error = ""
     authz = request.headers.get("Authorization", "")
     if not authz.startswith("Bearer "):
+        verify_admin_bearer_token.last_error = "missing_bearer_token"
         return None
     id_token = authz[7:].strip()
     from firebase_admin import auth as fb_auth
     try:
-        decoded = fb_auth.verify_id_token(id_token)
-        return decoded
-    except Exception:
+        return fb_auth.verify_id_token(id_token, clock_skew_seconds=60)
+    except Exception as e:
+        verify_admin_bearer_token.last_error = f"{type(e).__name__}: {str(e)[:160]}"
         return None
+
+
+def forbidden_admin_response(decoded):
+    reason = verify_admin_bearer_token.last_error or ("not_admin_uid" if decoded else "unknown")
+    return jsonify({"error": "forbidden", "reason": reason}), 403
 
 
 @app.route("/auth/admin-unlock", methods=["POST"])
@@ -950,7 +962,7 @@ def auth_admin_unlock():
     """
     decoded = verify_admin_bearer_token()
     if not decoded or decoded.get("uid") != ADMIN_UID:
-        return jsonify({"error": "forbidden"}), 403
+        return forbidden_admin_response(decoded)
 
     data = request.get_json(silent=True) or {}
     pin = (data.get("pin") or "").strip()
@@ -1004,7 +1016,7 @@ def auth_admin_set_pin():
     """Admin seteaza/schimba direct PIN-ul altui user (sau al sau propriu)."""
     decoded = verify_admin_bearer_token()
     if not decoded or decoded.get("uid") != ADMIN_UID:
-        return jsonify({"error": "forbidden"}), 403
+        return forbidden_admin_response(decoded)
 
     data = request.get_json(silent=True) or {}
     target_user_id = (data.get("targetUserId") or "").strip()
@@ -1034,7 +1046,7 @@ def auth_admin_reset_pin():
     """Admin sterge PIN-ul unui user — la urmatoarea logare i se va cere sa seteze unul nou."""
     decoded = verify_admin_bearer_token()
     if not decoded or decoded.get("uid") != ADMIN_UID:
-        return jsonify({"error": "forbidden"}), 403
+        return forbidden_admin_response(decoded)
 
     data = request.get_json(silent=True) or {}
     target_user_id = (data.get("targetUserId") or "").strip()

@@ -937,6 +937,68 @@ def verify_admin_bearer_token():
         return None
 
 
+@app.route("/auth/admin-unlock", methods=["POST"])
+def auth_admin_unlock():
+    """Deblocare rapida a ecranului pentru Admin cu PIN.
+
+    Admin-ul se logheaza INTAI cu email+parola (Firebase). Dupa blocarea ecranului
+    la inactivitate, poate deschide aplicatia cu PIN-ul de 6 cifre. Cererea trebuie
+    sa poarte ID token-ul sesiunii Admin deja autentificate (Bearer) — deci PIN-ul
+    NU poate fi folosit ca sa se logheze cineva de la zero, doar sa deblocheze o
+    sesiune existenta. PIN-ul e verificat pe server, cu aceeasi blocare la
+    incercari gresite ca la ceilalti useri.
+    """
+    decoded = verify_admin_bearer_token()
+    if not decoded or decoded.get("uid") != ADMIN_UID:
+        return jsonify({"error": "forbidden"}), 403
+
+    data = request.get_json(silent=True) or {}
+    pin = (data.get("pin") or "").strip()
+    if not is_valid_pin_format(pin):
+        return jsonify({"error": "invalid_request"}), 400
+
+    try:
+        db = get_firestore()
+    except Exception as e:
+        return jsonify({"error": "server_config", "detail": str(e)}), 500
+
+    user_id = "admin"
+    ref, udata = get_user_doc_ref_and_data(db, user_id)
+
+    lock_remaining = check_and_get_lockout_seconds(udata)
+    if lock_remaining > 0:
+        return jsonify({"error": "locked", "retryAfterSeconds": lock_remaining}), 423
+
+    stored_hash = udata.get("pinHashV2")
+    if not stored_hash:
+        return jsonify({"error": "no_pin_set"}), 404
+
+    try:
+        hashed = hash_pin_server(pin, user_id)
+    except RuntimeError as e:
+        return jsonify({"error": "server_config", "detail": str(e)}), 500
+
+    if not hmac.compare_digest(hashed, stored_hash):
+        fail_count = int(udata.get("pinFailCount", 0)) + 1
+        update = {"pinFailCount": fail_count}
+        locked = fail_count >= PIN_MAX_ATTEMPTS
+        if locked:
+            update["pinLockedUntil"] = datetime.now(timezone.utc) + timedelta(seconds=PIN_LOCKOUT_SECONDS)
+            update["pinFailCount"] = 0
+        ref.set(update, merge=True)
+        if locked:
+            return jsonify({"error": "locked", "retryAfterSeconds": PIN_LOCKOUT_SECONDS}), 423
+        return jsonify({"error": "wrong_pin", "attemptsLeft": PIN_MAX_ATTEMPTS - fail_count}), 401
+
+    from firebase_admin import firestore as fb_firestore
+    ref.set({
+        "pinFailCount": 0,
+        "pinLockedUntil": fb_firestore.DELETE_FIELD,
+        "lastLogin": fb_firestore.SERVER_TIMESTAMP,
+    }, merge=True)
+    return jsonify({"ok": True})
+
+
 @app.route("/auth/admin-set-pin", methods=["POST"])
 def auth_admin_set_pin():
     """Admin seteaza/schimba direct PIN-ul altui user (sau al sau propriu)."""

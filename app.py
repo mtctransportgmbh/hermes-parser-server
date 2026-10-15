@@ -938,6 +938,10 @@ def verify_admin_bearer_token():
     id_token = authz[7:].strip()
     from firebase_admin import auth as fb_auth
     try:
+        # IMPORTANT: aplicatia Firebase Admin se initializeaza "lazy" in get_firestore().
+        # Daca prima cerere dupa pornirea serverului e una de Admin, verify_id_token
+        # esua cu "default Firebase app does not exist" -> 403 fals. O initializam aici.
+        get_firestore()
         return fb_auth.verify_id_token(id_token, clock_skew_seconds=60)
     except Exception as e:
         verify_admin_bearer_token.last_error = f"{type(e).__name__}: {str(e)[:160]}"

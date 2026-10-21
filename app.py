@@ -1156,10 +1156,19 @@ def gh_cfg():
 
 # ── Criptare backup (AES-256-GCM). Datele NU ajung niciodata necriptate in GitHub. ──
 def bk_key():
-    k = os.environ.get("BACKUP_ENCRYPTION_KEY", "").strip()
+    k = os.environ.get("BACKUP_ENCRYPTION_KEY", "").strip().strip("\"'").strip()
     if len(k) < 24:
         return None
     return hashlib.sha256(("mtc-backup-v1|" + k).encode("utf-8")).digest()
+
+
+def bk_key_state():
+    """Diagnostic fara a dezvalui cheia: 'ok' / 'missing' / 'short:<lungime>'."""
+    raw = os.environ.get("BACKUP_ENCRYPTION_KEY")
+    if raw is None:
+        return "missing"
+    n = len(raw.strip().strip("\"'").strip())
+    return "ok" if n >= 24 else f"short:{n}"
 
 
 def bk_encrypt(plain, key):
@@ -1219,7 +1228,7 @@ def run_github_backup(by):
             raise RuntimeError("Lipsesc variabilele: " + ", ".join(missing))
         key = bk_key()
         if not key:
-            raise RuntimeError("Lipsește BACKUP_ENCRYPTION_KEY (minim 24 de caractere) pe Render. Backup-ul nu se face niciodată necriptat.")
+            raise RuntimeError("BACKUP_ENCRYPTION_KEY pe Render: " + {"missing": "variabila nu există (verifică numele exact)"}.get(bk_key_state(), "prea scurtă (" + bk_key_state() + " caractere, minim 24)") + ". Backup-ul nu se face niciodată necriptat.")
         if not gh_repo_private(tok, repo):
             raise RuntimeError("Repo-ul de backup este PUBLIC. Fă-l privat în GitHub (Settings → Danger Zone → Change repository visibility). Backup-ul a fost oprit.")
         backup_set_status(db, state="running", startedAt=datetime.now(timezone.utc).isoformat(), by=by, error="")
@@ -1319,7 +1328,7 @@ def backup_github_list():
     try:
         is_private = gh_repo_private(tok, repo)
         commits = gh_api("GET", f"/repos/{repo}/commits?sha={br}&path=backup/manifest.json&per_page=40", tok)
-        return jsonify({"repo": repo, "private": is_private, "encrypted": bool(bk_key()), "commits": [
+        return jsonify({"repo": repo, "private": is_private, "encrypted": bool(bk_key()), "keyState": bk_key_state(), "commits": [
             {"sha": c["sha"], "date": c["commit"]["committer"]["date"], "message": c["commit"]["message"].split("\n")[0]}
             for c in commits]})
     except Exception as e:

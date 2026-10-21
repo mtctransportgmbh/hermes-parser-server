@@ -12,6 +12,7 @@ import os
 import re
 import hmac
 import hashlib
+import base64
 import json
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify
@@ -1153,6 +1154,38 @@ def gh_cfg():
     return tok, repo, br, missing
 
 
+# ── Criptare backup (AES-256-GCM). Datele NU ajung niciodata necriptate in GitHub. ──
+def bk_key():
+    k = os.environ.get("BACKUP_ENCRYPTION_KEY", "").strip()
+    if len(k) < 24:
+        return None
+    return hashlib.sha256(("mtc-backup-v1|" + k).encode("utf-8")).digest()
+
+
+def bk_encrypt(plain, key):
+    """Compresie + AES-256-GCM. Nonce deterministic (HMAC din continut): aceleasi date -> acelasi
+    text criptat, deci 'fara modificari' se detecteaza corect si git nu creeaza commit-uri inutile."""
+    import zlib
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    data = zlib.compress(plain.encode("utf-8"), 9)
+    nonce = hmac.new(hashlib.sha256(key + b"nonce").digest(), data, hashlib.sha256).digest()[:12]
+    ct = AESGCM(key).encrypt(nonce, data, b"mtc-backup-v1")
+    return json.dumps({"v": 1, "alg": "AES-256-GCM", "z": 1,
+                       "n": base64.b64encode(nonce).decode(), "c": base64.b64encode(ct).decode()}) + "\n"
+
+
+def bk_decrypt(text, key):
+    import zlib
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    o = json.loads(text)
+    data = AESGCM(key).decrypt(base64.b64decode(o["n"]), base64.b64decode(o["c"]), b"mtc-backup-v1")
+    return (zlib.decompress(data) if o.get("z") else data).decode("utf-8")
+
+
+def gh_repo_private(tok, repo):
+    return bool(gh_api("GET", f"/repos/{repo}", tok).get("private"))
+
+
 def gh_api(method, path, tok, body=None, accept="application/vnd.github+json", raw=False):
     req = urllib.request.Request(
         "https://api.github.com" + path,
@@ -1184,15 +1217,20 @@ def run_github_backup(by):
         tok, repo, br, missing = gh_cfg()
         if missing:
             raise RuntimeError("Lipsesc variabilele: " + ", ".join(missing))
+        key = bk_key()
+        if not key:
+            raise RuntimeError("Lipsește BACKUP_ENCRYPTION_KEY (minim 24 de caractere) pe Render. Backup-ul nu se face niciodată necriptat.")
+        if not gh_repo_private(tok, repo):
+            raise RuntimeError("Repo-ul de backup este PUBLIC. Fă-l privat în GitHub (Settings → Danger Zone → Change repository visibility). Backup-ul a fost oprit.")
         backup_set_status(db, state="running", startedAt=datetime.now(timezone.utc).isoformat(), by=by, error="")
         files, counts = {}, {}
         for mod in BACKUP_MODULES:
             recs = bk_collect_module(db, mod)
             counts[mod["key"]] = len(recs)
             body = "[\n" + ",\n".join(json.dumps(r, ensure_ascii=False, sort_keys=True) for r in recs) + "\n]\n"
-            files[f"backup/{mod['key']}.json"] = body
+            files[f"backup/{mod['key']}.enc"] = bk_encrypt(body, key)
         now = datetime.now(timezone.utc)
-        manifest = {"format": "mtc-backup-v2", "createdAt": now.isoformat(), "by": by, "counts": counts}
+        manifest = {"format": "mtc-backup-v3-encrypted", "createdAt": now.isoformat(), "by": by, "counts": counts}
         files["backup/manifest.json"] = json.dumps(manifest, ensure_ascii=False, indent=1) + "\n"
 
         ref = gh_api("GET", f"/repos/{repo}/git/ref/heads/{br}", tok)
@@ -1206,6 +1244,13 @@ def run_github_backup(by):
                 continue  # manifestul (cu ora) il adaugam doar daca s-a schimbat altceva
             blob = gh_api("POST", f"/repos/{repo}/git/blobs", tok, {"content": content, "encoding": "utf-8"})
             tree_items.append({"path": path, "mode": "100644", "type": "blob", "sha": blob["sha"]})
+        # sterge fisierele vechi necriptate (backup/<modul>.json), daca mai exista in ultimul commit
+        old_tree = gh_api("GET", f"/repos/{repo}/git/trees/{base_tree}?recursive=1", tok)
+        existing = {t["path"] for t in old_tree.get("tree", [])}
+        for m in BACKUP_MODULES:
+            p = f"backup/{m['key']}.json"
+            if p in existing:
+                tree_items.append({"path": p, "mode": "100644", "type": "blob", "sha": None})
         tree = gh_api("POST", f"/repos/{repo}/git/trees", tok, {"base_tree": base_tree, "tree": tree_items})
         if tree["sha"] == base_tree:
             backup_set_status(db, state="ok", changed=False, counts=counts, lastCheckAt=now.isoformat(),
@@ -1272,8 +1317,9 @@ def backup_github_list():
     if missing:
         return jsonify({"error": "not_configured", "missing": missing}), 503
     try:
+        is_private = gh_repo_private(tok, repo)
         commits = gh_api("GET", f"/repos/{repo}/commits?sha={br}&path=backup/manifest.json&per_page=40", tok)
-        return jsonify({"repo": repo, "commits": [
+        return jsonify({"repo": repo, "private": is_private, "encrypted": bool(bk_key()), "commits": [
             {"sha": c["sha"], "date": c["commit"]["committer"]["date"], "message": c["commit"]["message"].split("\n")[0]}
             for c in commits]})
     except Exception as e:
@@ -1294,11 +1340,80 @@ def backup_github_get():
     if not re.fullmatch(r"[0-9a-f]{7,40}", sha) or (module != "manifest" and module not in BACKUP_MODULE_KEYS):
         return jsonify({"error": "bad_request"}), 400
     try:
+        if module == "manifest":
+            raw = gh_api("GET", f"/repos/{repo}/contents/backup/manifest.json?ref={sha}", tok,
+                         accept="application/vnd.github.raw+json", raw=True)
+            return app.response_class(raw, mimetype="application/json")
+        try:
+            raw = gh_api("GET", f"/repos/{repo}/contents/backup/{module}.enc?ref={sha}", tok,
+                         accept="application/vnd.github.raw+json", raw=True)
+            key = bk_key()
+            if not key:
+                return jsonify({"error": "no_key", "detail": "BACKUP_ENCRYPTION_KEY lipsește de pe server"}), 503
+            return app.response_class(bk_decrypt(raw.decode("utf-8"), key), mimetype="application/json")
+        except RuntimeError as e:
+            if "404" not in str(e):
+                raise
+        # commit vechi, dinainte de criptare
         raw = gh_api("GET", f"/repos/{repo}/contents/backup/{module}.json?ref={sha}", tok,
                      accept="application/vnd.github.raw+json", raw=True)
         return app.response_class(raw, mimetype="application/json")
     except Exception as e:
         return jsonify({"error": "github_error", "detail": str(e)}), 502
+
+
+
+# ══════════════════════════════════════════════════════
+# ANGAJATI (citire prin server, fara a atinge regulile Firestore din proiectul Angajati)
+# Necesita pe Render variabila ANGAJATI_SERVICE_ACCOUNT_JSON = continutul cheii de service
+# account a proiectului angajati-f1b01 (Firebase Console -> Project settings -> Service accounts).
+# Service account-ul ocoleste regulile, deci nu trebuie modificat nimic acolo. Doar citire.
+# ══════════════════════════════════════════════════════
+_ang_app = None
+_ang_cache = {"t": 0, "docs": None}
+
+def get_angajati_db():
+    global _ang_app
+    import firebase_admin
+    from firebase_admin import credentials, firestore
+    if _ang_app is None:
+        raw = os.environ.get("ANGAJATI_SERVICE_ACCOUNT_JSON", "").strip()
+        if not raw:
+            raise RuntimeError("not_configured")
+        cred = credentials.Certificate(json.loads(raw))
+        _ang_app = firebase_admin.initialize_app(cred, name="angajati")
+    return firestore.client(app=_ang_app)
+
+
+@app.route("/angajati/list", methods=["POST", "OPTIONS"])
+def angajati_list():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    decoded = verify_admin_bearer_token()      # orice utilizator autentificat in aplicatia Reclamatii
+    if not decoded:
+        return forbidden_admin_response(decoded)
+    import time
+    now = time.time()
+    if _ang_cache["docs"] is not None and now - _ang_cache["t"] < 8:
+        return jsonify({"ok": True, "docs": _ang_cache["docs"], "cached": True})
+    try:
+        db_ang = get_angajati_db()
+    except RuntimeError as e:
+        if str(e) == "not_configured":
+            return jsonify({"error": "not_configured", "missing": ["ANGAJATI_SERVICE_ACCOUNT_JSON"]}), 503
+        return jsonify({"error": "config_error", "detail": str(e)[:200]}), 500
+    except Exception as e:
+        return jsonify({"error": "config_error", "detail": f"{type(e).__name__}: {str(e)[:200]}"}), 500
+    try:
+        docs = []
+        for d in db_ang.collection("angajati").stream():
+            data = d.to_dict() or {}
+            docs.append({"id": d.id, "data": {k: v for k, v in data.items() if isinstance(v, str)}})
+        _ang_cache["docs"] = docs
+        _ang_cache["t"] = now
+        return jsonify({"ok": True, "docs": docs})
+    except Exception as e:
+        return jsonify({"error": "read_failed", "detail": f"{type(e).__name__}: {str(e)[:200]}"}), 500
 
 
 if __name__ == "__main__":

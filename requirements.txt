@@ -4,3 +4,4 @@ pdfplumber==0.11.4
 gunicorn==22.0.0
 odfpy==1.4.1
 firebase-admin==6.5.0
+cryptography>=42.0.0

@@ -1069,6 +1069,238 @@ def auth_admin_reset_pin():
     return jsonify({"ok": True})
 
 
+# ══════════════════════════════════════════════════════
+# BACKUP IN GITHUB — export complet Firestore -> repository PRIVAT (un commit / backup)
+# Variabile de mediu pe Render:
+#   GITHUB_BACKUP_TOKEN  = token GitHub (fine-grained, DOAR repo-ul de backup, Contents: Read & write)
+#   GITHUB_BACKUP_REPO   = "utilizator/nume-repo"  (privat, initializat cu un README)
+#   GITHUB_BACKUP_BRANCH = (optional) implicit "main"
+#   BACKUP_CRON_SECRET   = secret pentru declansarea automata din GitHub Actions
+# Fiecare modul = un fisier backup/<modul>.json (o inregistrare pe linie -> diferente curate in git).
+# Istoricul commit-urilor = istoricul backup-urilor; se poate restaura orice commit din aplicatie.
+# Formatul valorilor e identic cu cel din aplicatie: {"__ts":[sec,nanos]}, {"__gp":[lat,lng]}, {"__ref":"cale"}.
+# ══════════════════════════════════════════════════════
+import threading
+import urllib.request
+import urllib.error
+import base64
+
+BACKUP_MODULES = [
+    {"key": "reclamatii",       "cols": ["reclamatii"]},
+    {"key": "rechnunguri",      "cols": ["rechnunguri"]},
+    {"key": "rechn_lipsa",      "cols": ["rechnung_lipsa"]},
+    {"key": "soferi",           "cols": ["soferi"]},
+    {"key": "pachete_livrate",  "cols": ["pachete_livrate"]},
+    {"key": "pachete_pierdute", "cols": ["pachete_pierdute"]},
+    {"key": "utilizatori",      "cols": ["users"], "no_pin": True},
+    {"key": "setari",           "cols": ["setari", "config"],
+     "skip_docs": ["config/versiune", "config/ultimulBackup", "config/ultimulBackupV2"]},
+    {"key": "notificari",       "cols": ["notificari"]},
+    {"key": "geocode",          "cols": ["geocode_cache"]},
+]
+# Spatiul Corinei (soferi_corina / reclamatii_corina) NU se salveaza in GitHub — e privat.
+BACKUP_MODULE_KEYS = [m["key"] for m in BACKUP_MODULES]
+_backup_lock = threading.Lock()
+_backup_running = False
+
+
+def bk_encode(v):
+    from google.cloud.firestore_v1._helpers import GeoPoint
+    from google.cloud.firestore_v1.document import DocumentReference
+    if v is None or isinstance(v, (bool, int, str)):
+        return v
+    if isinstance(v, float):
+        return v if v == v and v not in (float("inf"), float("-inf")) else None
+    if isinstance(v, datetime):  # include DatetimeWithNanoseconds
+        if v.tzinfo is None:
+            v = v.replace(tzinfo=timezone.utc)
+        nanos = getattr(v, "nanosecond", None)
+        if nanos is None:
+            nanos = v.microsecond * 1000
+        return {"__ts": [int(v.timestamp()), int(nanos)]}
+    if isinstance(v, GeoPoint):
+        return {"__gp": [v.latitude, v.longitude]}
+    if isinstance(v, DocumentReference):
+        return {"__ref": v.path}
+    if isinstance(v, (bytes, bytearray)):
+        return {"__b64": base64.b64encode(bytes(v)).decode("ascii")}
+    if isinstance(v, (list, tuple)):
+        return [bk_encode(x) for x in v]
+    if isinstance(v, dict):
+        return {k: bk_encode(x) for k, x in v.items()}
+    return str(v)
+
+
+def bk_collect_module(db, mod):
+    recs = []
+    for col in mod["cols"]:
+        for d in db.collection(col).stream():
+            if f"{col}/{d.id}" in mod.get("skip_docs", []):
+                continue
+            data = bk_encode(d.to_dict() or {})
+            if mod.get("no_pin"):
+                data = {k: x for k, x in data.items() if not re.match(r"^(pin|failed|locked|lockout)", k, re.I)}
+            recs.append({"c": col, "id": d.id, "d": data})
+    recs.sort(key=lambda r: (r["c"], r["id"]))
+    return recs
+
+
+def gh_cfg():
+    tok = os.environ.get("GITHUB_BACKUP_TOKEN", "").strip()
+    repo = os.environ.get("GITHUB_BACKUP_REPO", "").strip()
+    br = os.environ.get("GITHUB_BACKUP_BRANCH", "main").strip() or "main"
+    missing = [n for n, v in (("GITHUB_BACKUP_TOKEN", tok), ("GITHUB_BACKUP_REPO", repo)) if not v]
+    return tok, repo, br, missing
+
+
+def gh_api(method, path, tok, body=None, accept="application/vnd.github+json", raw=False):
+    req = urllib.request.Request(
+        "https://api.github.com" + path,
+        data=(json.dumps(body).encode("utf-8") if body is not None else None),
+        method=method,
+        headers={"Authorization": "Bearer " + tok, "Accept": accept,
+                 "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "mtc-reclamatii-backup",
+                 "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            data = r.read()
+            return data if raw else (json.loads(data.decode("utf-8")) if data else {})
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "ignore")[:300]
+        raise RuntimeError(f"GitHub {e.code}: {detail}")
+
+
+def backup_set_status(db, **fields):
+    from firebase_admin import firestore as fb_firestore
+    fields["updatedAt"] = fb_firestore.SERVER_TIMESTAMP
+    db.collection("setari").document("github_backup_status").set(fields, merge=True)
+
+
+def run_github_backup(by):
+    global _backup_running
+    try:
+        db = get_firestore()
+        tok, repo, br, missing = gh_cfg()
+        if missing:
+            raise RuntimeError("Lipsesc variabilele: " + ", ".join(missing))
+        backup_set_status(db, state="running", startedAt=datetime.now(timezone.utc).isoformat(), by=by, error="")
+        files, counts = {}, {}
+        for mod in BACKUP_MODULES:
+            recs = bk_collect_module(db, mod)
+            counts[mod["key"]] = len(recs)
+            body = "[\n" + ",\n".join(json.dumps(r, ensure_ascii=False, sort_keys=True) for r in recs) + "\n]\n"
+            files[f"backup/{mod['key']}.json"] = body
+        now = datetime.now(timezone.utc)
+        manifest = {"format": "mtc-backup-v2", "createdAt": now.isoformat(), "by": by, "counts": counts}
+        files["backup/manifest.json"] = json.dumps(manifest, ensure_ascii=False, indent=1) + "\n"
+
+        ref = gh_api("GET", f"/repos/{repo}/git/ref/heads/{br}", tok)
+        head_sha = ref["object"]["sha"]
+        head_commit = gh_api("GET", f"/repos/{repo}/git/commits/{head_sha}", tok)
+        base_tree = head_commit["tree"]["sha"]
+
+        tree_items = []
+        for path, content in files.items():
+            if path.endswith("manifest.json"):
+                continue  # manifestul (cu ora) il adaugam doar daca s-a schimbat altceva
+            blob = gh_api("POST", f"/repos/{repo}/git/blobs", tok, {"content": content, "encoding": "utf-8"})
+            tree_items.append({"path": path, "mode": "100644", "type": "blob", "sha": blob["sha"]})
+        tree = gh_api("POST", f"/repos/{repo}/git/trees", tok, {"base_tree": base_tree, "tree": tree_items})
+        if tree["sha"] == base_tree:
+            backup_set_status(db, state="ok", changed=False, counts=counts, lastCheckAt=now.isoformat(),
+                              message="Fără modificări față de ultimul backup")
+            return
+        mblob = gh_api("POST", f"/repos/{repo}/git/blobs", tok, {"content": files["backup/manifest.json"], "encoding": "utf-8"})
+        tree = gh_api("POST", f"/repos/{repo}/git/trees", tok, {
+            "base_tree": base_tree,
+            "tree": tree_items + [{"path": "backup/manifest.json", "mode": "100644", "type": "blob", "sha": mblob["sha"]}]})
+        summary = " · ".join(f"{k} {v}" for k, v in counts.items() if v)
+        msg = f"Backup {now.strftime('%Y-%m-%d %H:%M')} UTC ({by}) — {summary}"
+        commit = gh_api("POST", f"/repos/{repo}/git/commits", tok,
+                        {"message": msg, "tree": tree["sha"], "parents": [head_sha]})
+        gh_api("PATCH", f"/repos/{repo}/git/refs/heads/{br}", tok, {"sha": commit["sha"]})
+        backup_set_status(db, state="ok", changed=True, counts=counts, lastBackupAt=now.isoformat(),
+                          lastCheckAt=now.isoformat(), commit=commit["sha"],
+                          url=f"https://github.com/{repo}/commit/{commit['sha']}", message=msg)
+    except Exception as e:
+        try:
+            backup_set_status(get_firestore(), state="error", error=str(e)[:400])
+        except Exception:
+            pass
+        print("Backup GitHub esuat:", e, flush=True)
+    finally:
+        with _backup_lock:
+            _backup_running = False
+
+
+def backup_authorized():
+    """Admin (token Firebase) SAU secretul de cron. Intoarce (ok, by, response_dict_if_not_ok)."""
+    secret = os.environ.get("BACKUP_CRON_SECRET", "")
+    sent = request.headers.get("X-Backup-Secret", "")
+    if secret and sent and hmac.compare_digest(secret, sent):
+        return True, "automat (GitHub Actions)", None
+    decoded = verify_admin_bearer_token()
+    if decoded and decoded.get("uid") == ADMIN_UID:
+        return True, "Admin", None
+    return False, "", forbidden_admin_response(decoded)
+
+
+@app.route("/backup/github/run", methods=["POST"])
+def backup_github_run():
+    global _backup_running
+    ok, by, deny = backup_authorized()
+    if not ok:
+        return deny
+    tok, repo, br, missing = gh_cfg()
+    if missing:
+        return jsonify({"error": "not_configured", "missing": missing}), 503
+    with _backup_lock:
+        if _backup_running:
+            return jsonify({"ok": True, "state": "already_running"}), 202
+        _backup_running = True
+    threading.Thread(target=run_github_backup, args=(by,), daemon=True).start()
+    return jsonify({"ok": True, "state": "started"}), 202
+
+
+@app.route("/backup/github/list", methods=["POST"])
+def backup_github_list():
+    ok, by, deny = backup_authorized()
+    if not ok or by != "Admin":
+        return deny or (jsonify({"error": "forbidden"}), 403)
+    tok, repo, br, missing = gh_cfg()
+    if missing:
+        return jsonify({"error": "not_configured", "missing": missing}), 503
+    try:
+        commits = gh_api("GET", f"/repos/{repo}/commits?sha={br}&path=backup/manifest.json&per_page=40", tok)
+        return jsonify({"repo": repo, "commits": [
+            {"sha": c["sha"], "date": c["commit"]["committer"]["date"], "message": c["commit"]["message"].split("\n")[0]}
+            for c in commits]})
+    except Exception as e:
+        return jsonify({"error": "github_error", "detail": str(e)}), 502
+
+
+@app.route("/backup/github/get", methods=["POST"])
+def backup_github_get():
+    """Intoarce manifestul sau inregistrarile unui modul la un commit anume (pentru restaurare)."""
+    ok, by, deny = backup_authorized()
+    if not ok or by != "Admin":
+        return deny or (jsonify({"error": "forbidden"}), 403)
+    tok, repo, br, missing = gh_cfg()
+    if missing:
+        return jsonify({"error": "not_configured", "missing": missing}), 503
+    body = request.get_json(silent=True) or {}
+    sha, module = str(body.get("sha", "")), str(body.get("module", ""))
+    if not re.fullmatch(r"[0-9a-f]{7,40}", sha) or (module != "manifest" and module not in BACKUP_MODULE_KEYS):
+        return jsonify({"error": "bad_request"}), 400
+    try:
+        raw = gh_api("GET", f"/repos/{repo}/contents/backup/{module}.json?ref={sha}", tok,
+                     accept="application/vnd.github.raw+json", raw=True)
+        return app.response_class(raw, mimetype="application/json")
+    except Exception as e:
+        return jsonify({"error": "github_error", "detail": str(e)}), 502
+
+
 if __name__ == "__main__":
     import os
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

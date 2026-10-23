@@ -884,6 +884,60 @@ def is_valid_pin_format(pin):
     return bool(re.match(r"^\d{6}$", pin or ""))
 
 
+_WEAK_PINS = {"123321", "112233", "102030", "010203", "159753", "147258", "258369", "789456",
+              "741852", "369258", "000111", "111222", "121314", "123123", "112211", "198765"}
+
+def is_weak_pin(pin):
+    """PIN prea ușor de ghicit: cifre identice (111111), secvențe (123456, 654321, 012345),
+    repetiții (121212, 123123) sau din lista scurtă de PIN-uri uzuale."""
+    if not is_valid_pin_format(pin):
+        return True
+    if len(set(pin)) == 1:
+        return True
+    d = [int(c) for c in pin]
+    step = d[1] - d[0]
+    if step in (1, -1) and all(d[i] - d[i - 1] == step for i in range(1, 6)):
+        return True
+    for k in (2, 3):
+        if pin == pin[:k] * (6 // k):
+            return True
+    return pin in _WEAK_PINS
+
+
+# Blocare progresivă: primele 2 greșeli doar avertizează; a 3-a → 5 min, a 4-a → 15 min, a 5-a și următoarele → 1 oră.
+# Contorul se resetează la un PIN corect sau după 24 h fără greșeli. Nu există blocare definitivă
+# (altfel cineva din exterior ar putea bloca pe oricine); Admin poate debloca oricând prin „Schimbă”/„Resetează PIN”.
+PIN_FREE_ATTEMPTS = 2
+PIN_LOCK_STEPS = [300, 900, 3600]          # secunde, pentru greșeala nr. 3, 4, 5+
+PIN_FAIL_DECAY_SECONDS = 24 * 3600
+
+def lockout_seconds_for(fail_count):
+    if fail_count <= PIN_FREE_ATTEMPTS:
+        return 0
+    return PIN_LOCK_STEPS[min(fail_count - PIN_FREE_ATTEMPTS, len(PIN_LOCK_STEPS)) - 1]
+
+def register_failed_pin(ref, udata):
+    now = datetime.now(timezone.utc)
+    prev = int(udata.get("pinFailCount", 0))
+    last = udata.get("pinLastFailAt")
+    try:
+        if last is not None:
+            last_dt = last if getattr(last, "tzinfo", None) else last.replace(tzinfo=timezone.utc)
+            if (now - last_dt).total_seconds() > PIN_FAIL_DECAY_SECONDS:
+                prev = 0
+    except Exception:
+        pass
+    fail_count = prev + 1
+    secs = lockout_seconds_for(fail_count)
+    update = {"pinFailCount": fail_count, "pinLastFailAt": now}
+    if secs:
+        update["pinLockedUntil"] = now + timedelta(seconds=secs)
+    ref.set(update, merge=True)
+    if secs:
+        return jsonify({"error": "locked", "retryAfterSeconds": secs}), 423
+    return jsonify({"error": "wrong_pin", "attemptsLeft": PIN_FREE_ATTEMPTS + 1 - fail_count}), 401
+
+
 def check_and_get_lockout_seconds(udata):
     """Intoarce cate secunde mai sunt de asteptat daca userul e blocat, altfel 0."""
     locked_until = udata.get("pinLockedUntil")
@@ -931,22 +985,14 @@ def auth_login_pin():
         return jsonify({"error": "server_config", "detail": str(e)}), 500
 
     if not hmac.compare_digest(hashed, stored_hash):
-        fail_count = int(udata.get("pinFailCount", 0)) + 1
-        update = {"pinFailCount": fail_count}
-        locked = fail_count >= PIN_MAX_ATTEMPTS
-        if locked:
-            update["pinLockedUntil"] = datetime.now(timezone.utc) + timedelta(seconds=PIN_LOCKOUT_SECONDS)
-            update["pinFailCount"] = 0
-        ref.set(update, merge=True)
-        if locked:
-            return jsonify({"error": "locked", "retryAfterSeconds": PIN_LOCKOUT_SECONDS}), 423
-        return jsonify({"error": "wrong_pin", "attemptsLeft": PIN_MAX_ATTEMPTS - fail_count}), 401
+        return register_failed_pin(ref, udata)
 
     # PIN corect — resetam contorul de esecuri si emitem custom token
     from firebase_admin import auth as fb_auth, firestore as fb_firestore
     ref.set({
         "pinFailCount": 0,
         "pinLockedUntil": fb_firestore.DELETE_FIELD,
+        "pin": fb_firestore.DELETE_FIELD,
         "lastLogin": fb_firestore.SERVER_TIMESTAMP,
     }, merge=True)
     token = fb_auth.create_custom_token(user_id)
@@ -972,6 +1018,8 @@ def auth_setup_pin():
     ref, udata = get_user_doc_ref_and_data(db, user_id)
     if udata.get("pinHashV2"):
         return jsonify({"error": "pin_already_set"}), 409
+    if is_weak_pin(pin):
+        return jsonify({"error": "pin_too_weak"}), 422
     # Prima setare e permisă DOAR după ce Admin a pornit-o (Resetează PIN sau PIN setat de Admin).
     # Fără asta, oricine din internet ar putea prelua un cont care nu are încă PIN.
     if udata.get("pinResetRequired") is not True:
@@ -985,7 +1033,7 @@ def auth_setup_pin():
     from firebase_admin import auth as fb_auth, firestore as fb_firestore
     ref.set({
         "pinHashV2": hashed,
-        "pin": pin,  # pastram PIN-ul in clar DOAR pentru afisare admin (ca si pana acum)
+        "pin": fb_firestore.DELETE_FIELD,   # PIN-ul NU se mai păstrează în clar
         "pinSetAt": datetime.now(timezone.utc).isoformat(),
         "pinFailCount": 0,
         "pinLockedUntil": fb_firestore.DELETE_FIELD,
@@ -1068,16 +1116,7 @@ def auth_admin_unlock():
         return jsonify({"error": "server_config", "detail": str(e)}), 500
 
     if not hmac.compare_digest(hashed, stored_hash):
-        fail_count = int(udata.get("pinFailCount", 0)) + 1
-        update = {"pinFailCount": fail_count}
-        locked = fail_count >= PIN_MAX_ATTEMPTS
-        if locked:
-            update["pinLockedUntil"] = datetime.now(timezone.utc) + timedelta(seconds=PIN_LOCKOUT_SECONDS)
-            update["pinFailCount"] = 0
-        ref.set(update, merge=True)
-        if locked:
-            return jsonify({"error": "locked", "retryAfterSeconds": PIN_LOCKOUT_SECONDS}), 423
-        return jsonify({"error": "wrong_pin", "attemptsLeft": PIN_MAX_ATTEMPTS - fail_count}), 401
+        return register_failed_pin(ref, udata)
 
     from firebase_admin import firestore as fb_firestore
     ref.set({
@@ -1100,6 +1139,8 @@ def auth_admin_set_pin():
     new_pin = (data.get("newPin") or "").strip()
     if target_user_id not in ADMIN_PIN_TARGETS or not is_valid_pin_format(new_pin):
         return jsonify({"error": "invalid_request"}), 400
+    if is_weak_pin(new_pin):
+        return jsonify({"error": "pin_too_weak"}), 422
 
     try:
         db = get_firestore()
@@ -1110,12 +1151,30 @@ def auth_admin_set_pin():
     from firebase_admin import firestore as fb_firestore
     db.collection("users").document(target_user_id).set({
         "pinHashV2": hashed,
-        "pin": new_pin,
+        "pin": fb_firestore.DELETE_FIELD,   # PIN-ul NU se mai păstrează în clar
         "pinSetAt": datetime.now(timezone.utc).isoformat(),
         "pinFailCount": 0,
         "pinLockedUntil": fb_firestore.DELETE_FIELD,
     }, merge=True)
     return jsonify({"ok": True})
+
+
+@app.route("/auth/admin-purge-plain-pins", methods=["POST"])
+def auth_admin_purge_plain_pins():
+    """Șterge câmpul `pin` (PIN în clar) din toate conturile. Idempotent; doar Admin."""
+    decoded = verify_admin_bearer_token()
+    if not decoded or decoded.get("uid") != ADMIN_UID:
+        return forbidden_admin_response(decoded)
+    from firebase_admin import firestore as fb_firestore
+    db = get_firestore()
+    n = 0
+    for uid_ in ADMIN_PIN_TARGETS:
+        ref = db.collection("users").document(uid_)
+        snap = ref.get()
+        if snap.exists and "pin" in (snap.to_dict() or {}):
+            ref.update({"pin": fb_firestore.DELETE_FIELD})
+            n += 1
+    return jsonify({"ok": True, "purged": n})
 
 
 @app.route("/auth/admin-reset-pin", methods=["POST"])

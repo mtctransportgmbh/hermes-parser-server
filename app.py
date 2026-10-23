@@ -23,7 +23,11 @@ from odf.table import Table, TableRow, TableCell
 from odf.text import P as OdfP
 
 app = Flask(__name__)
-CORS(app)
+# CORS: doar domeniul aplicației (poți adăuga altele, separate prin virgulă, în ALLOWED_ORIGINS pe Render)
+_ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "https://reclamatii.mtctransportgmbh.de").split(",") if o.strip()]
+CORS(app, origins=_ALLOWED_ORIGINS)
+# Limită de mărime pentru orice cerere (PDF/ODS/atașamente Mailgun) — protecție împotriva fișierelor uriașe
+app.config["MAX_CONTENT_LENGTH"] = 30 * 1024 * 1024
 
 # ── Firebase Admin SDK (pentru webhook-ul de import automat din email) ──
 # Necesita variabila de mediu FIREBASE_SERVICE_ACCOUNT_JSON pe Render
@@ -605,6 +609,9 @@ def home():
 
 @app.route("/parse", methods=["POST"])
 def parse_endpoint():
+    _u, _deny = require_parse_user()
+    if _deny:
+        return _deny
     if "file" not in request.files:
         return jsonify({"error": "Lipsește cheia 'file'"}), 400
     f = request.files["file"]
@@ -618,6 +625,9 @@ def parse_endpoint():
 
 @app.route("/parse-ods", methods=["POST"])
 def parse_ods_endpoint():
+    _u, _deny = require_parse_user()
+    if _deny:
+        return _deny
     if "file" not in request.files:
         return jsonify({"error": "Lipsește cheia 'file'"}), 400
     try:
@@ -631,6 +641,9 @@ def parse_sachverhalt_dpd_endpoint():
     """Parseaza un PDF Sachverhalt DPD ('Paketdaten ...') — folosit de spațiul
     Corinei pentru a completa automat nume/adresă/tour/dată livrare la adăugarea
     unei reclamații noi. Suma rămâne mereu introdusă manual (nu e în acest PDF)."""
+    _u, _deny = require_parse_user()
+    if _deny:
+        return _deny
     if "file" not in request.files:
         return jsonify({"error": "Lipsește cheia 'file'"}), 400
     f = request.files["file"]
@@ -802,6 +815,56 @@ PIN_MAX_ATTEMPTS = 3
 PIN_LOCKOUT_SECONDS = 300
 ADMIN_UID = "itgIGVH3Y2ZaGCSwJa7yt7Nd14R2"
 
+# Singurele conturi care pot avea PIN. Orice alt "userId" e refuzat — altfel oricine ar putea
+# inventa un utilizator nou, își seta un PIN și primea un token valid pentru baza de date.
+PIN_USERS = {"tania", "raluca", "mihaela", "madalina", "corina"}
+ADMIN_PIN_TARGETS = PIN_USERS | {"admin"}
+
+# ── Limitare simplă a cererilor (în memorie, per proces) ──
+import time as _time
+import threading as _threading
+_rl_lock = _threading.Lock()
+_rl_hits = {}
+
+def client_ip():
+    xff = request.headers.get("X-Forwarded-For", "")
+    return (xff.split(",")[0].strip() if xff else (request.remote_addr or "?"))
+
+def rate_limited(bucket, key, limit, window_s):
+    """True dacă `key` a depășit `limit` cereri în ultimele `window_s` secunde."""
+    now = _time.time()
+    k = (bucket, key)
+    with _rl_lock:
+        hits = [t for t in _rl_hits.get(k, []) if now - t < window_s]
+        if len(hits) >= limit:
+            _rl_hits[k] = hits
+            return True
+        hits.append(now)
+        _rl_hits[k] = hits
+        if len(_rl_hits) > 5000:   # curățare ocazională
+            for kk in [kk for kk, v in _rl_hits.items() if not v or now - v[-1] > 3600]:
+                _rl_hits.pop(kk, None)
+        return False
+
+def require_parse_user():
+    """Pentru /parse*: autentificare obligatorie, cu o excepție TEMPORARĂ controlată de variabila
+    PARSE_REQUIRE_AUTH=0 (folosită doar cât timp pagina veche nu trimite încă tokenul). Implicit: obligatoriu."""
+    if os.environ.get("PARSE_REQUIRE_AUTH", "1").strip() == "0":
+        if rate_limited("parse_open", client_ip(), 20, 60):
+            return None, (jsonify({"error": "too_many_requests"}), 429)
+        return None, None
+    return require_app_user()
+
+def require_app_user():
+    """Verifică tokenul Firebase din Authorization: Bearer și că uid-ul e un cont real al aplicației.
+    Întoarce (decoded, None) sau (None, răspuns_de_eroare)."""
+    decoded = verify_admin_bearer_token()
+    if not decoded or (decoded.get("uid") not in PIN_USERS and decoded.get("uid") != ADMIN_UID):
+        return None, forbidden_admin_response(decoded)
+    if rate_limited("api", decoded.get("uid"), 60, 60):
+        return None, (jsonify({"error": "too_many_requests"}), 429)
+    return decoded, None
+
 
 def hash_pin_server(pin, user_id):
     """Hash SHA-256 cu salt secret (server-only) — nu mai poate fi reprodus din JS client."""
@@ -842,8 +905,10 @@ def auth_login_pin():
     data = request.get_json(silent=True) or {}
     user_id = (data.get("userId") or "").strip()
     pin = (data.get("pin") or "").strip()
-    if not user_id or not is_valid_pin_format(pin):
+    if not user_id or not is_valid_pin_format(pin) or user_id not in PIN_USERS:
         return jsonify({"error": "invalid_request"}), 400
+    if rate_limited("login", client_ip(), 30, 600):
+        return jsonify({"error": "too_many_requests"}), 429
 
     try:
         db = get_firestore()
@@ -894,8 +959,10 @@ def auth_setup_pin():
     data = request.get_json(silent=True) or {}
     user_id = (data.get("userId") or "").strip()
     pin = (data.get("pin") or "").strip()
-    if not user_id or not is_valid_pin_format(pin):
+    if not user_id or not is_valid_pin_format(pin) or user_id not in PIN_USERS:
         return jsonify({"error": "invalid_request"}), 400
+    if rate_limited("setup", client_ip(), 10, 600):
+        return jsonify({"error": "too_many_requests"}), 429
 
     try:
         db = get_firestore()
@@ -905,6 +972,10 @@ def auth_setup_pin():
     ref, udata = get_user_doc_ref_and_data(db, user_id)
     if udata.get("pinHashV2"):
         return jsonify({"error": "pin_already_set"}), 409
+    # Prima setare e permisă DOAR după ce Admin a pornit-o (Resetează PIN sau PIN setat de Admin).
+    # Fără asta, oricine din internet ar putea prelua un cont care nu are încă PIN.
+    if udata.get("pinResetRequired") is not True:
+        return jsonify({"error": "setup_not_allowed"}), 403
 
     try:
         hashed = hash_pin_server(pin, user_id)
@@ -918,6 +989,7 @@ def auth_setup_pin():
         "pinSetAt": datetime.now(timezone.utc).isoformat(),
         "pinFailCount": 0,
         "pinLockedUntil": fb_firestore.DELETE_FIELD,
+        "pinResetRequired": fb_firestore.DELETE_FIELD,
         "lastLogin": fb_firestore.SERVER_TIMESTAMP,
     }, merge=True)
     token = fb_auth.create_custom_token(user_id)
@@ -1026,7 +1098,7 @@ def auth_admin_set_pin():
     data = request.get_json(silent=True) or {}
     target_user_id = (data.get("targetUserId") or "").strip()
     new_pin = (data.get("newPin") or "").strip()
-    if not target_user_id or not is_valid_pin_format(new_pin):
+    if target_user_id not in ADMIN_PIN_TARGETS or not is_valid_pin_format(new_pin):
         return jsonify({"error": "invalid_request"}), 400
 
     try:
@@ -1055,7 +1127,7 @@ def auth_admin_reset_pin():
 
     data = request.get_json(silent=True) or {}
     target_user_id = (data.get("targetUserId") or "").strip()
-    if not target_user_id:
+    if target_user_id not in ADMIN_PIN_TARGETS:
         return jsonify({"error": "invalid_request"}), 400
 
     db = get_firestore()
@@ -1398,9 +1470,11 @@ def get_angajati_db():
 def angajati_list():
     if request.method == "OPTIONS":
         return ("", 204)
-    decoded = verify_admin_bearer_token()      # orice utilizator autentificat in aplicatia Reclamatii
-    if not decoded:
-        return forbidden_admin_response(decoded)
+    decoded, deny = require_app_user()          # doar conturi reale ale aplicației
+    if deny:
+        return deny
+    if decoded.get("uid") == "corina":          # spațiul Corinei nu are legătură cu Angajați
+        return jsonify({"error": "forbidden"}), 403
     import time
     now = time.time()
     if _ang_cache["docs"] is not None and now - _ang_cache["t"] < 8:

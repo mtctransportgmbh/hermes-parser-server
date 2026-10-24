@@ -1558,6 +1558,40 @@ def angajati_list():
         return jsonify({"error": "read_failed", "detail": f"{type(e).__name__}: {str(e)[:200]}"}), 500
 
 
+
+# ════════════════════════════════════════════════════════════════
+# SINCRONIZARE ANGAJATI -> aceasta aplicatie (server la server)
+# Cloud Function-ul "syncAngajatiAuto" din proiectul Angajati trimite lista minima aici,
+# cu secretul din variabila Render SYNC_SECRET (header X-Sync-Secret).
+# Astfel regula Firestore pentru angajati_sync/list poate fi INCHISA (write: false).
+# ════════════════════════════════════════════════════════════════
+@app.route("/sync-angajati", methods=["POST"])
+def sync_angajati():
+    ip = (request.headers.get("X-Forwarded-For", request.remote_addr or "") or "").split(",")[0].strip()
+    if rate_limited("syncang", ip, 30, 60):
+        return jsonify({"error": "too_many_requests"}), 429
+    expected = os.environ.get("SYNC_SECRET", "")
+    given = request.headers.get("X-Sync-Secret", "")
+    if not expected or not hmac.compare_digest(given.encode(), expected.encode()):
+        return jsonify({"error": "forbidden"}), 403
+    body = request.get_json(silent=True) or {}
+    items = body.get("items")
+    if not isinstance(items, list) or len(items) > 3000:
+        return jsonify({"error": "bad_request"}), 400
+    def _s(v): return str(v or "")
+    def _l(v): return [str(x) for x in v] if isinstance(v, list) else []
+    clean = [{
+        "id": _s(e.get("id")), "nume": _s(e.get("nume")), "status": _s(e.get("status")) or "Activ",
+        "start": _s(e.get("start")), "end": _s(e.get("end")), "depot": _s(e.get("depot")),
+        "locatii": _l(e.get("locatii")), "coord": _s(e.get("coord")), "link": _s(e.get("link")),
+        "roluri": _l(e.get("roluri")),
+    } for e in items if isinstance(e, dict)]
+    db = get_firestore()
+    db.collection("angajati_sync").document("list").set({
+        "items": clean, "count": len(clean), "updatedAt": datetime.now(timezone.utc).isoformat()})
+    return jsonify({"ok": True, "count": len(clean)})
+
+
 if __name__ == "__main__":
     import os
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

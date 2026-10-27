@@ -916,7 +916,7 @@ def lockout_seconds_for(fail_count):
         return 0
     return PIN_LOCK_STEPS[min(fail_count - PIN_FREE_ATTEMPTS, len(PIN_LOCK_STEPS)) - 1]
 
-def register_failed_pin(ref, udata):
+def register_failed_pin(ref, udata, err_name="wrong_pin"):
     now = datetime.now(timezone.utc)
     prev = int(udata.get("pinFailCount", 0))
     last = udata.get("pinLastFailAt")
@@ -935,7 +935,7 @@ def register_failed_pin(ref, udata):
     ref.set(update, merge=True)
     if secs:
         return jsonify({"error": "locked", "retryAfterSeconds": secs}), 423
-    return jsonify({"error": "wrong_pin", "attemptsLeft": PIN_FREE_ATTEMPTS + 1 - fail_count}), 401
+    return jsonify({"error": err_name, "attemptsLeft": PIN_FREE_ATTEMPTS + 1 - fail_count}), 401
 
 
 def check_and_get_lockout_seconds(udata):
@@ -951,6 +951,179 @@ def check_and_get_lockout_seconds(udata):
         return max(0, int(remaining))
     except Exception:
         return 0
+
+
+# ══════════════════════════════════════════════════════
+# 2FA — Google Authenticator (TOTP, RFC 6238), pentru conturile cu PIN + Admin.
+#  • Secretele stau în colecția `totp` (doar server; regulile Firestore o închid clienților).
+#  • Conturile cu PIN: după PIN corect se cere și codul; greșelile se numără în ACELAȘI contor ca PIN-ul.
+#  • Admin: după login cu email+parolă, serverul deschide o sesiune (`totp_sessions/admin`, 12 h) doar după cod
+#    corect; regulile Firestore cer această sesiune pentru contul de Admin cât timp 2FA e activ.
+#  Fără 2FA activat pentru un cont, nimic nu se schimbă pentru el.
+# ══════════════════════════════════════════════════════
+import struct as _struct
+import secrets as _secrets
+
+TOTP_SESSION_SECONDS = 12 * 3600
+
+def _totp_at(secret_bytes, step):
+    h = hmac.new(secret_bytes, _struct.pack(">Q", step), hashlib.sha1).digest()
+    o = h[-1] & 15
+    n = ((h[o] & 0x7F) << 24) | (h[o + 1] << 16) | (h[o + 2] << 8) | h[o + 3]
+    return str(n % 1000000).zfill(6)
+
+def totp_check(secret_b32, code, last_step=0, now=None):
+    """Întoarce pasul potrivit (int) sau None. Un pas deja folosit (<= last_step) nu mai e acceptat."""
+    if not re.match(r"^\d{6}$", code or ""):
+        return None
+    try:
+        sec = base64.b32decode(secret_b32.upper() + "=" * (-len(secret_b32) % 8))
+    except Exception:
+        return None
+    now_step = int((now if now is not None else _time.time()) // 30)
+    for d in (-1, 0, 1):
+        st = now_step + d
+        if st <= int(last_step or 0):
+            continue
+        if hmac.compare_digest(_totp_at(sec, st), code):
+            return st
+    return None
+
+def totp_doc(db, user_id):
+    snap = db.collection("totp").document(user_id).get()
+    return snap.to_dict() if snap.exists else {}
+
+def totp_enabled(db, user_id):
+    return bool(totp_doc(db, user_id).get("enabled"))
+
+def totp_verify_and_consume(db, user_id, code):
+    """True dacă `code` e valid pentru user (și îl marchează ca folosit)."""
+    t = totp_doc(db, user_id)
+    if not t.get("enabled"):
+        return True
+    step = totp_check(t.get("secret", ""), code, t.get("lastStep", 0))
+    if step is None:
+        return False
+    db.collection("totp").document(user_id).set({"lastStep": step}, merge=True)
+    return True
+
+def admin_session_write(db, decoded):
+    # Sesiunea e legată de LOGIN-ul curent (auth_time din tokenul Firebase): cine se loghează ulterior cu
+    # email+parolă are alt auth_time și nu primește acces la date fără propriul cod 2FA.
+    db.collection("totp_sessions").document("admin").set({
+        "exp": int((_time.time() + TOTP_SESSION_SECONDS) * 1000),
+        "authTime": int(decoded.get("auth_time") or 0),
+    })
+
+def admin_session_valid(db, decoded):
+    snap = db.collection("totp_sessions").document("admin").get()
+    d = (snap.to_dict() or {}) if snap.exists else {}
+    return bool(d and int(d.get("exp", 0)) > int(_time.time() * 1000)
+                and int(d.get("authTime", -1)) == int(decoded.get("auth_time") or 0))
+
+def require_admin_bearer():
+    decoded = verify_admin_bearer_token()
+    if not decoded or decoded.get("uid") != ADMIN_UID:
+        return None, forbidden_admin_response(decoded)
+    return decoded, None
+
+@app.route("/auth/admin-session", methods=["POST"])
+def auth_admin_session():
+    """După login Admin cu email+parolă: dacă 2FA e activ, cere codul și deschide sesiunea de date."""
+    decoded, err = require_admin_bearer()
+    if err:
+        return err
+    if rate_limited("admin-session", client_ip(), 20, 600):
+        return jsonify({"error": "too_many_requests"}), 429
+    db = get_firestore()
+    if not totp_enabled(db, "admin"):
+        return jsonify({"ok": True, "twofa": False})
+    ref, udata = get_user_doc_ref_and_data(db, "admin")
+    lock_remaining = check_and_get_lockout_seconds(udata)
+    if lock_remaining > 0:
+        return jsonify({"error": "locked", "retryAfterSeconds": lock_remaining}), 423
+    code = ((request.get_json(silent=True) or {}).get("code") or "").strip()
+    if not re.match(r"^\d{6}$", code):
+        return jsonify({"error": "code_required"}), 401
+    if not totp_verify_and_consume(db, "admin", code):
+        return register_failed_pin(ref, udata, "wrong_code")
+    from firebase_admin import firestore as fb_firestore
+    ref.set({"pinFailCount": 0, "pinLockedUntil": fb_firestore.DELETE_FIELD}, merge=True)
+    admin_session_write(db, decoded)
+    return jsonify({"ok": True, "twofa": True})
+
+@app.route("/auth/admin-totp-status", methods=["POST"])
+def auth_admin_totp_status():
+    _, err = require_admin_bearer()
+    if err:
+        return err
+    db = get_firestore()
+    return jsonify({"status": {u: totp_enabled(db, u) for u in sorted(ADMIN_PIN_TARGETS)}})
+
+@app.route("/auth/admin-totp-setup", methods=["POST"])
+def auth_admin_totp_setup():
+    _, err = require_admin_bearer()
+    if err:
+        return err
+    target = ((request.get_json(silent=True) or {}).get("targetUserId") or "").strip()
+    if target not in ADMIN_PIN_TARGETS:
+        return jsonify({"error": "invalid_request"}), 400
+    db = get_firestore()
+    if totp_enabled(db, target):
+        return jsonify({"error": "already_enabled"}), 409
+    secret = base64.b32encode(_secrets.token_bytes(20)).decode("ascii").rstrip("=")
+    db.collection("totp").document(target).set({"secret": secret, "enabled": False, "pending": True, "lastStep": 0,
+                                                 "createdAt": datetime.now(timezone.utc).isoformat()})
+    from urllib.parse import quote
+    label = {"admin": "Admin"}.get(target, target.capitalize())
+    url = ("otpauth://totp/" + quote("MTC Reclamatii:" + label) + "?secret=" + secret +
+           "&issuer=" + quote("MTC Reclamatii") + "&algorithm=SHA1&digits=6&period=30")
+    return jsonify({"secret": secret, "url": url, "label": label})
+
+@app.route("/auth/admin-totp-confirm", methods=["POST"])
+def auth_admin_totp_confirm():
+    decoded, err = require_admin_bearer()
+    if err:
+        return err
+    if rate_limited("totp-confirm", client_ip(), 20, 600):
+        return jsonify({"error": "too_many_requests"}), 429
+    data = request.get_json(silent=True) or {}
+    target = (data.get("targetUserId") or "").strip()
+    code = (data.get("code") or "").strip()
+    if target not in ADMIN_PIN_TARGETS:
+        return jsonify({"error": "invalid_request"}), 400
+    db = get_firestore()
+    t = totp_doc(db, target)
+    if not t.get("pending"):
+        return jsonify({"error": "no_setup_in_progress"}), 409
+    step = totp_check(t.get("secret", ""), code, 0)
+    if step is None:
+        return jsonify({"error": "wrong_code"}), 422
+    db.collection("totp").document(target).set({"enabled": True, "pending": False, "lastStep": step,
+                                                 "enabledAt": datetime.now(timezone.utc).isoformat()}, merge=True)
+    if target == "admin":
+        admin_session_write(db, decoded)          # sesiunea curentă de Admin rămâne deschisă
+    else:
+        try:                              # conturile PIN deja logate trebuie să treacă din nou prin cod
+            from firebase_admin import auth as fb_auth
+            fb_auth.revoke_refresh_tokens(target)
+        except Exception as e:
+            print("revoke_refresh_tokens:", e)
+    return jsonify({"ok": True})
+
+@app.route("/auth/admin-totp-disable", methods=["POST"])
+def auth_admin_totp_disable():
+    _, err = require_admin_bearer()
+    if err:
+        return err
+    target = ((request.get_json(silent=True) or {}).get("targetUserId") or "").strip()
+    if target not in ADMIN_PIN_TARGETS:
+        return jsonify({"error": "invalid_request"}), 400
+    db = get_firestore()
+    db.collection("totp").document(target).delete()
+    if target == "admin":
+        db.collection("totp_sessions").document("admin").delete()
+    return jsonify({"ok": True})
 
 
 @app.route("/auth/login-pin", methods=["POST"])
@@ -986,6 +1159,14 @@ def auth_login_pin():
 
     if not hmac.compare_digest(hashed, stored_hash):
         return register_failed_pin(ref, udata)
+
+    # 2FA activ: după PIN corect cerem și codul (aceeași blocare progresivă la greșeli)
+    if totp_enabled(db, user_id):
+        code = (data.get("code") or "").strip()
+        if not re.match(r"^\d{6}$", code):
+            return jsonify({"error": "code_required"}), 401
+        if not totp_verify_and_consume(db, user_id, code):
+            return register_failed_pin(ref, udata, "wrong_code")
 
     # PIN corect — resetam contorul de esecuri si emitem custom token
     from firebase_admin import auth as fb_auth, firestore as fb_firestore
@@ -1029,6 +1210,14 @@ def auth_setup_pin():
         hashed = hash_pin_server(pin, user_id)
     except RuntimeError as e:
         return jsonify({"error": "server_config", "detail": str(e)}), 500
+
+    # cu 2FA activ, un PIN nou nu dă acces fără cod
+    if totp_enabled(db, user_id):
+        code = (data.get("code") or "").strip()
+        if not re.match(r"^\d{6}$", code):
+            return jsonify({"error": "code_required"}), 401
+        if not totp_verify_and_consume(db, user_id, code):
+            return register_failed_pin(ref, udata, "wrong_code")
 
     from firebase_admin import auth as fb_auth, firestore as fb_firestore
     ref.set({
@@ -1117,6 +1306,16 @@ def auth_admin_unlock():
 
     if not hmac.compare_digest(hashed, stored_hash):
         return register_failed_pin(ref, udata)
+
+    # 2FA Admin: dacă sesiunea de date a expirat, deblocarea cu PIN cere și codul
+    if totp_enabled(db, "admin"):
+        if not admin_session_valid(db, decoded):
+            code = (data.get("code") or "").strip()
+            if not re.match(r"^\d{6}$", code):
+                return jsonify({"error": "code_required"}), 401
+            if not totp_verify_and_consume(db, "admin", code):
+                return register_failed_pin(ref, udata, "wrong_code")
+        admin_session_write(db, decoded)
 
     from firebase_admin import firestore as fb_firestore
     ref.set({

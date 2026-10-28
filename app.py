@@ -1007,6 +1007,30 @@ def totp_verify_and_consume(db, user_id, code):
     db.collection("totp").document(user_id).set({"lastStep": step}, merge=True)
     return True
 
+# "Dispozitiv de încredere pe azi": după un cod corect, serverul poate da un jeton aleator (păstrat doar ca hash în
+# documentul `totp`, valabil până la miezul nopții, ora Germaniei). PIN-ul / parola se cer în continuare; jetonul doar
+# scutește de cod. Dezactivarea / refacerea 2FA șterge documentul, deci și jetoanele.
+def _trust_eod_ms():
+    from zoneinfo import ZoneInfo
+    now = datetime.now(ZoneInfo("Europe/Berlin"))
+    end = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return int(end.timestamp() * 1000)
+
+def totp_trust_ok(db, user_id, token):
+    if not isinstance(token, str) or not (20 <= len(token) <= 200):
+        return False
+    h = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    exp = int((totp_doc(db, user_id).get("trusted") or {}).get(h, 0) or 0)
+    return exp > int(_time.time() * 1000)
+
+def totp_trust_issue(db, user_id):
+    token = _secrets.token_urlsafe(32)
+    now = int(_time.time() * 1000)
+    tr = {k: v for k, v in (totp_doc(db, user_id).get("trusted") or {}).items() if int(v or 0) > now}
+    tr[hashlib.sha256(token.encode("utf-8")).hexdigest()] = _trust_eod_ms()
+    db.collection("totp").document(user_id).update({"trusted": tr})
+    return token
+
 def admin_session_write(db, decoded):
     # Sesiunea e legată de LOGIN-ul curent (auth_time din tokenul Firebase): cine se loghează ulterior cu
     # email+parolă are alt auth_time și nu primește acces la date fără propriul cod 2FA.
@@ -1042,15 +1066,20 @@ def auth_admin_session():
     lock_remaining = check_and_get_lockout_seconds(udata)
     if lock_remaining > 0:
         return jsonify({"error": "locked", "retryAfterSeconds": lock_remaining}), 423
-    code = ((request.get_json(silent=True) or {}).get("code") or "").strip()
-    if not re.match(r"^\d{6}$", code):
-        return jsonify({"error": "code_required"}), 401
-    if not totp_verify_and_consume(db, "admin", code):
-        return register_failed_pin(ref, udata, "wrong_code")
+    body = request.get_json(silent=True) or {}
+    trust_new = None
+    if not totp_trust_ok(db, "admin", body.get("trustToken")):
+        code = (body.get("code") or "").strip()
+        if not re.match(r"^\d{6}$", code):
+            return jsonify({"error": "code_required"}), 401
+        if not totp_verify_and_consume(db, "admin", code):
+            return register_failed_pin(ref, udata, "wrong_code")
+        if body.get("trust") is True:
+            trust_new = totp_trust_issue(db, "admin")
     from firebase_admin import firestore as fb_firestore
     ref.set({"pinFailCount": 0, "pinLockedUntil": fb_firestore.DELETE_FIELD}, merge=True)
     admin_session_write(db, decoded)
-    return jsonify({"ok": True, "twofa": True})
+    return jsonify({"ok": True, "twofa": True, "trustToken": trust_new})
 
 @app.route("/auth/admin-totp-status", methods=["POST"])
 def auth_admin_totp_status():
@@ -1161,12 +1190,15 @@ def auth_login_pin():
         return register_failed_pin(ref, udata)
 
     # 2FA activ: după PIN corect cerem și codul (aceeași blocare progresivă la greșeli)
-    if totp_enabled(db, user_id):
+    trust_new = None
+    if totp_enabled(db, user_id) and not totp_trust_ok(db, user_id, data.get("trustToken")):
         code = (data.get("code") or "").strip()
         if not re.match(r"^\d{6}$", code):
             return jsonify({"error": "code_required"}), 401
         if not totp_verify_and_consume(db, user_id, code):
             return register_failed_pin(ref, udata, "wrong_code")
+        if data.get("trust") is True:
+            trust_new = totp_trust_issue(db, user_id)
 
     # PIN corect — resetam contorul de esecuri si emitem custom token
     from firebase_admin import auth as fb_auth, firestore as fb_firestore
@@ -1177,7 +1209,7 @@ def auth_login_pin():
         "lastLogin": fb_firestore.SERVER_TIMESTAMP,
     }, merge=True)
     token = fb_auth.create_custom_token(user_id)
-    return jsonify({"token": token.decode("utf-8") if isinstance(token, bytes) else token})
+    return jsonify({"token": token.decode("utf-8") if isinstance(token, bytes) else token, "trustToken": trust_new})
 
 
 @app.route("/auth/setup-pin", methods=["POST"])
@@ -1308,13 +1340,16 @@ def auth_admin_unlock():
         return register_failed_pin(ref, udata)
 
     # 2FA Admin: dacă sesiunea de date a expirat, deblocarea cu PIN cere și codul
+    trust_new = None
     if totp_enabled(db, "admin"):
-        if not admin_session_valid(db, decoded):
+        if not admin_session_valid(db, decoded) and not totp_trust_ok(db, "admin", data.get("trustToken")):
             code = (data.get("code") or "").strip()
             if not re.match(r"^\d{6}$", code):
                 return jsonify({"error": "code_required"}), 401
             if not totp_verify_and_consume(db, "admin", code):
                 return register_failed_pin(ref, udata, "wrong_code")
+            if data.get("trust") is True:
+                trust_new = totp_trust_issue(db, "admin")
         admin_session_write(db, decoded)
 
     from firebase_admin import firestore as fb_firestore
@@ -1323,7 +1358,7 @@ def auth_admin_unlock():
         "pinLockedUntil": fb_firestore.DELETE_FIELD,
         "lastLogin": fb_firestore.SERVER_TIMESTAMP,
     }, merge=True)
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "trustToken": trust_new})
 
 
 @app.route("/auth/admin-set-pin", methods=["POST"])

@@ -404,8 +404,20 @@ def parse_sachverhalt_pdf(file_bytes):
     # acord (nu predat direct), spre deosebire de "Zustelladresse"/"übergeben"
     result["esteAblageort"] = bool(header_word and header_word["text"] == "Ablageort")
 
+    # "Nachbar" = pachetul a fost predat la VECIN. In PDF: pe randul "Originaladresse:" (stanga),
+    # in coloana din dreapta apare titlul "Nachbar" in loc de "Zustelladresse".
+    result["esteVecin"] = False
+    if not header_word:
+        orig_hdr = next((w for w in words if w["text"].startswith("Originaladresse")), None)
+        if orig_hdr:
+            right_hdr = next((w for w in words if abs(w["top"] - orig_hdr["top"]) <= 3 and 250 <= w["x0"] <= 420), None)
+            if right_hdr:
+                header_word = right_hdr
+                result["_yh"] = max(right_hdr["top"], orig_hdr["top"])
+                result["esteVecin"] = right_hdr["text"].startswith("Nachbar")
+
     if header_word:
-        yh = header_word["top"]
+        yh = max(header_word["top"], result.pop("_yh", 0))
         quelle_word = next((w for w in words if w["text"].startswith("Quelle") and 250 <= w["x0"] <= 420 and w["top"] > yh), None)
         y_bottom = quelle_word["top"] if quelle_word else yh + 60
 
@@ -427,6 +439,12 @@ def parse_sachverhalt_pdf(file_bytes):
         norm_orig = normalize_strada(orig["strasse"])
         norm_deliv = normalize_strada(deliv["strasse"])
         result["adresaLivrareDiferita"] = bool(norm_orig and norm_deliv and norm_orig != norm_deliv)
+
+        if result["esteVecin"]:
+            # Numele din coloana dreapta e al VECINULUI; clientul real = destinatarul original (stanga)
+            result["vecinNume"] = deliv["name"]
+            result["name"] = orig["name"]
+            result["vecinAdresa"] = ", ".join(x for x in [deliv["strasse"], (deliv["plz"] + " " + deliv["ort"]).strip()] if x)
 
         if result.get("name"):
             parts = [p.strip() for p in result["name"].split(",")]
@@ -744,6 +762,11 @@ def webhook_sachverhalt():
                 descriere_parts.append(f"⚠️ PACHET LIVRAT LA ALTĂ ADRESĂ! Original: {orig_full} · Livrat efectiv: {deliv_full}")
 
             este_ablageort = parsed.get("esteAblageort", False)
+            este_vecin = parsed.get("esteVecin", False)
+            vecin_nume = parsed.get("vecinNume", "")
+            vecin_adresa = parsed.get("vecinAdresa", "")
+            if este_vecin:
+                descriere_parts.append("⚠️ LIVRAT LA VECIN (Nachbar)" + (f": {vecin_nume}" if vecin_nume else "") + (f" · {vecin_adresa}" if vecin_adresa else ""))
             if este_ablageort:
                 descriere_parts.append("⚠️ ACORD DE OPRIRE — pachetul a fost lăsat la locul de depozitare stabilit (Ablageort), nu predat direct")
 
@@ -761,6 +784,9 @@ def webhook_sachverhalt():
                 "origOrt": parsed.get("origOrt", ""),
                 "adresaLivrareDiferita": adresa_diferita,
                 "esteAblageort": este_ablageort,
+                "esteVecin": este_vecin,
+                "vecinNume": vecin_nume,
+                "vecinAdresa": vecin_adresa,
                 "turaSofer": tour,
                 "locatie": locatie,
                 "numarPachet": sendungs_id,

@@ -763,6 +763,29 @@ def stamp_pdf_with_number(pdf_bytes, label, when_txt):
         return pdf_bytes
 
 
+def to_grayscale_pdf(pdf_bytes, dpi=240):
+    """Transformă PDF-ul în tonuri de gri (nuanțe de negru), ca imprimanta să nu consume cerneală color.
+    Pagina devine imagine gri (~240 dpi). La orice eroare întoarce PDF-ul original.
+    Dezactivare: PRINT_GRAYSCALE=0 pe Render."""
+    if os.environ.get("PRINT_GRAYSCALE", "1").strip() == "0":
+        return pdf_bytes
+    try:
+        import pypdfium2 as pdfium
+        pdf = pdfium.PdfDocument(pdf_bytes)
+        imgs = []
+        for i in range(len(pdf)):
+            page = pdf[i]
+            imgs.append(page.render(scale=dpi / 72.0).to_pil().convert("L"))
+        if not imgs:
+            return pdf_bytes
+        out = io.BytesIO()
+        imgs[0].save(out, format="PDF", resolution=float(dpi), save_all=True, append_images=imgs[1:])
+        return out.getvalue()
+    except Exception as e:
+        print("to_grayscale_pdf eroare:", e)
+        return pdf_bytes
+
+
 def send_pdf_to_printer(pdf_bytes, label):
     """Trimite PDF-ul la imprimantă prin Mailgun. Întoarce (ok, mesaj)."""
     cfg = print_config()
@@ -922,7 +945,7 @@ def webhook_sachverhalt():
                 doc["nrIntern"] = nr_intern
                 doc["nrInternLabel"] = nr_label
                 when_txt = datetime.now(timezone(timedelta(hours=1))).strftime("%d.%m.%Y %H:%M")
-                stamped = stamp_pdf_with_number(file_bytes, nr_label, when_txt)
+                stamped = to_grayscale_pdf(stamp_pdf_with_number(file_bytes, nr_label, when_txt))
                 if print_config():
                     ok_p, msg_p = send_pdf_to_printer(stamped, nr_label)
                     doc["printStatus"] = "trimis" if ok_p else "eroare"

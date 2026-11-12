@@ -673,6 +673,117 @@ def parse_sachverhalt_dpd_endpoint():
         return jsonify({"error": str(e)}), 500
 
 
+# ══════════════════════════════════════════════════════
+# NUMĂR INTERN + TIPĂRIRE AUTOMATĂ (Epson Connect Email Print, prin Mailgun)
+#
+# Pentru fiecare Sachverhalt NOU primit prin email:
+#   1. Se dă un număr intern consecutiv (R-2026-0001, repornește în fiecare an)
+#   2. Numărul se ștampilează pe prima pagină a PDF-ului
+#   3. PDF-ul ștampilat se trimite prin Mailgun la adresa imprimantei (PRINT_EMAIL_TO)
+#   4. Starea (trimis / eroare) se salvează pe reclamație, ca să se poată retrimite
+#
+# Variabile Render: MAILGUN_API_KEY, MAILGUN_DOMAIN, PRINT_EMAIL_TO,
+#   (opțional) MAILGUN_API_BASE (https://api.eu.mailgun.net pentru EU),
+#   PRINT_FROM (implicit print@<MAILGUN_DOMAIN>), PRINT_DELAY_SECONDS (implicit 4),
+#   PRINT_ENABLED=0 ca să dezactivezi tipărirea (numerotarea rămâne).
+# ══════════════════════════════════════════════════════
+
+def _store_print_pdf(db, label, pdf_bytes):
+    """Păstrat pentru compatibilitate; PDF-ul se salvează după ce reclamația are id (vezi webhook)."""
+    return None
+
+
+def print_config():
+    key = os.environ.get("MAILGUN_API_KEY", "").strip()
+    domain = os.environ.get("MAILGUN_DOMAIN", "").strip()
+    to = os.environ.get("PRINT_EMAIL_TO", "").strip()
+    if os.environ.get("PRINT_ENABLED", "1").strip() == "0":
+        return None
+    if not (key and domain and to):
+        return None
+    return {
+        "key": key, "domain": domain, "to": to,
+        "base": (os.environ.get("MAILGUN_API_BASE", "https://api.mailgun.net").strip().rstrip("/")),
+        "from": os.environ.get("PRINT_FROM", "").strip() or f"print@{domain}",
+    }
+
+
+def next_nr_intern(db):
+    """Număr consecutiv per an, atomic (tranzacție Firestore). Întoarce (nr, eticheta)."""
+    from firebase_admin import firestore as _fs
+    year = datetime.now(timezone(timedelta(hours=1))).year
+    ref = db.collection("config").document("reclamatii_counter")
+
+    @_fs.transactional
+    def _tx(tx):
+        snap = ref.get(transaction=tx)
+        cur = int((snap.to_dict() or {}).get(f"y{year}", 0)) if snap.exists else 0
+        nxt = cur + 1
+        tx.set(ref, {f"y{year}": nxt}, merge=True)
+        return nxt
+
+    nr = _tx(db.transaction())
+    return nr, f"R-{year}-{nr:04d}"
+
+
+def stamp_pdf_with_number(pdf_bytes, label, when_txt):
+    """Adaugă numărul intern (colțul din dreapta sus, prima pagină). La orice eroare întoarce PDF-ul original."""
+    try:
+        from pypdf import PdfReader, PdfWriter
+        from reportlab.pdfgen import canvas
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        first = reader.pages[0]
+        w = float(first.mediabox.width)
+        h = float(first.mediabox.height)
+        buf = io.BytesIO()
+        c = canvas.Canvas(buf, pagesize=(w, h))
+        c.setFillColorRGB(1, 1, 1)
+        c.setStrokeColorRGB(0.1, 0.1, 0.1)
+        c.setLineWidth(1.2)
+        bw, bh = 150, 34
+        x, y = w - bw - 24, h - bh - 18
+        c.roundRect(x, y, bw, bh, 5, stroke=1, fill=1)
+        c.setFillColorRGB(0, 0, 0)
+        c.setFont("Helvetica-Bold", 15)
+        c.drawCentredString(x + bw / 2, y + 17, label)
+        c.setFont("Helvetica", 7.5)
+        c.drawCentredString(x + bw / 2, y + 6, when_txt)
+        c.save()
+        buf.seek(0)
+        overlay = PdfReader(buf).pages[0]
+        first.merge_page(overlay)
+        writer = PdfWriter()
+        for p in reader.pages:
+            writer.add_page(p)
+        out = io.BytesIO()
+        writer.write(out)
+        return out.getvalue()
+    except Exception as e:
+        print("stamp_pdf_with_number eroare:", e)
+        return pdf_bytes
+
+
+def send_pdf_to_printer(pdf_bytes, label):
+    """Trimite PDF-ul la imprimantă prin Mailgun. Întoarce (ok, mesaj)."""
+    cfg = print_config()
+    if not cfg:
+        return False, "neconfigurat"
+    import requests
+    try:
+        r = requests.post(
+            f"{cfg['base']}/v3/{cfg['domain']}/messages",
+            auth=("api", cfg["key"]),
+            data={"from": f"MTC Print <{cfg['from']}>", "to": cfg["to"], "subject": label, "text": label},
+            files=[("attachment", (f"{label}.pdf", pdf_bytes, "application/pdf"))],
+            timeout=30,
+        )
+        if 200 <= r.status_code < 300:
+            return True, "ok"
+        return False, f"Mailgun {r.status_code}: {r.text[:200]}"
+    except Exception as e:
+        return False, f"eroare rețea: {str(e)[:200]}"
+
+
 @app.route("/webhook-sachverhalt", methods=["POST"])
 def webhook_sachverhalt():
     """
@@ -805,13 +916,72 @@ def webhook_sachverhalt():
                 "createdAt": firestore_server_timestamp(),
                 "updatedAt": firestore_server_timestamp(),
             }
-            db.collection("reclamatii").add(doc)
-            results.append({"filename": filename, "status": "adaugat", "sendungsId": sendungs_id, "nume": nume_client})
+            # Număr intern + ștampilă + trimitere la imprimantă (nu blochează importul dacă pică)
+            try:
+                nr_intern, nr_label = next_nr_intern(db)
+                doc["nrIntern"] = nr_intern
+                doc["nrInternLabel"] = nr_label
+                when_txt = datetime.now(timezone(timedelta(hours=1))).strftime("%d.%m.%Y %H:%M")
+                stamped = stamp_pdf_with_number(file_bytes, nr_label, when_txt)
+                if print_config():
+                    ok_p, msg_p = send_pdf_to_printer(stamped, nr_label)
+                    doc["printStatus"] = "trimis" if ok_p else "eroare"
+                    doc["printAt"] = datetime.now(timezone.utc).isoformat()
+                    doc["printError"] = "" if ok_p else msg_p
+                    doc["printAttempts"] = 1
+                    if not ok_p:
+                        _store_print_pdf(db, nr_label, stamped)
+                    _time.sleep(float(os.environ.get("PRINT_DELAY_SECONDS", "4")))
+                else:
+                    doc["printStatus"] = "neconfigurat"
+                    _store_print_pdf(db, nr_label, stamped)
+            except Exception as pe:
+                print("numerotare/tiparire eroare:", pe)
+                doc["printStatus"] = "eroare"
+                doc["printError"] = str(pe)[:200]
+            ref_new = db.collection("reclamatii").add(doc)[1]
+            if doc.get("printStatus") in ("eroare", "neconfigurat") and doc.get("nrInternLabel"):
+                try:
+                    db.collection("reclamatii_print_pdf").document(ref_new.id).set(
+                        {"label": doc["nrInternLabel"], "b64": base64.b64encode(stamped).decode("ascii")})
+                except Exception as se:
+                    print("salvare pdf pentru retrimitere eroare:", se)
+            results.append({"filename": filename, "status": "adaugat", "sendungsId": sendungs_id, "nume": nume_client,
+                            "nrIntern": doc.get("nrInternLabel"), "print": doc.get("printStatus")})
 
         return jsonify({"ok": True, "processed": results})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/print-retry", methods=["POST"])
+def print_retry():
+    """Retrimite la imprimantă o foaie care a eșuat (sau încă nu a fost trimisă). Body JSON: {"docId": "..."}"""
+    _u, _deny = require_app_user()
+    if _deny:
+        return _deny
+    data = request.get_json(silent=True) or {}
+    doc_id = str(data.get("docId", "")).strip()
+    if not doc_id:
+        return jsonify({"error": "docId lipsește"}), 400
+    if not print_config():
+        return jsonify({"error": "Tipărirea nu e configurată pe server (MAILGUN_API_KEY / MAILGUN_DOMAIN / PRINT_EMAIL_TO)"}), 400
+    db = get_firestore()
+    snap = db.collection("reclamatii_print_pdf").document(doc_id).get()
+    if not snap.exists:
+        return jsonify({"error": "Nu am PDF-ul salvat pentru această reclamație"}), 404
+    d = snap.to_dict() or {}
+    pdf = base64.b64decode(d.get("b64", ""))
+    ok_p, msg_p = send_pdf_to_printer(pdf, d.get("label", "Reclamatie"))
+    ref = db.collection("reclamatii").document(doc_id)
+    cur = (ref.get().to_dict() or {}).get("printAttempts", 0) or 0
+    upd = {"printStatus": "trimis" if ok_p else "eroare", "printAt": datetime.now(timezone.utc).isoformat(),
+           "printError": "" if ok_p else msg_p, "printAttempts": cur + 1}
+    ref.update(upd)
+    if ok_p:
+        db.collection("reclamatii_print_pdf").document(doc_id).delete()
+    return jsonify({"ok": ok_p, "message": msg_p})
 
 
 def firestore_server_timestamp():

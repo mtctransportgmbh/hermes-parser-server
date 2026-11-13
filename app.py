@@ -946,7 +946,14 @@ def webhook_sachverhalt():
                 doc["nrInternLabel"] = nr_label
                 when_txt = datetime.now(timezone(timedelta(hours=1))).strftime("%d.%m.%Y %H:%M")
                 stamped = to_grayscale_pdf(stamp_pdf_with_number(file_bytes, nr_label, when_txt))
-                if print_config():
+                only_locs = {x.strip().lower() for x in os.environ.get("PRINT_ONLY_LOCATIONS", "Ruhstorf").split(",") if x.strip()}
+                if print_config() and (locatie or "").strip().lower() not in only_locs:
+                    # se tipărește automat DOAR pentru locațiile din PRINT_ONLY_LOCATIONS (implicit Ruhstorf); restul rămân numerotate,
+                    # iar foaia se poate tipări manual din aplicație
+                    doc["printStatus"] = "omis"
+                    doc["printError"] = f"Locație {locatie or 'necunoscută'}: nu se tipărește automat"
+                    _store_print_pdf(db, nr_label, stamped)
+                elif print_config():
                     ok_p, msg_p = send_pdf_to_printer(stamped, nr_label)
                     doc["printStatus"] = "trimis" if ok_p else "eroare"
                     doc["printAt"] = datetime.now(timezone.utc).isoformat()
@@ -963,7 +970,7 @@ def webhook_sachverhalt():
                 doc["printStatus"] = "eroare"
                 doc["printError"] = str(pe)[:200]
             ref_new = db.collection("reclamatii").add(doc)[1]
-            if doc.get("printStatus") in ("eroare", "neconfigurat") and doc.get("nrInternLabel"):
+            if doc.get("printStatus") in ("eroare", "neconfigurat", "omis") and doc.get("nrInternLabel"):
                 try:
                     db.collection("reclamatii_print_pdf").document(ref_new.id).set(
                         {"label": doc["nrInternLabel"], "b64": base64.b64encode(stamped).decode("ascii")})

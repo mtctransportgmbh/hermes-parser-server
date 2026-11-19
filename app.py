@@ -867,8 +867,19 @@ def webhook_sachverhalt():
             # Cautam locatia dupa tura (daca soferul exista deja in baza)
             tour = parsed.get("tour", "")
             locatie = ""
+            tura_pdf = tour
+            tura_nota = ""
             if tour:
                 sofer_snap = db.collection("soferi").where("tura", "==", tour).limit(1).get()
+                if len(sofer_snap) == 0:
+                    # sofer cu mai multe ture: tura din PDF poate fi o tura suplimentara (turaExtra) -> o mapam pe tura principala
+                    sofer_snap = db.collection("soferi").where("turaExtra", "array_contains", tour).limit(1).get()
+                    if len(sofer_snap) > 0:
+                        sd = sofer_snap[0].to_dict() or {}
+                        main_t = str(sd.get("tura", "") or "").strip()
+                        if main_t:
+                            tura_nota = f"Tour în PDF: {tour} → atribuit turei {main_t}" + (f" ({sd.get('numeSofer')})" if sd.get("numeSofer") else "")
+                            tour = main_t
                 if len(sofer_snap) > 0:
                     locatie = sofer_snap[0].to_dict().get("locatie", "")
 
@@ -881,6 +892,8 @@ def webhook_sachverhalt():
 
             # Descriere auto-generata cu context util pentru trasabilitate
             descriere_parts = [f"⚡ Import automat din email ({sender})"]
+            if tura_nota:
+                descriere_parts.append(tura_nota)
             if subject:
                 descriere_parts.append(f"Subiect: {subject}")
             if parsed.get("ruckinfo"):
@@ -922,6 +935,7 @@ def webhook_sachverhalt():
                 "vecinNume": vecin_nume,
                 "vecinAdresa": vecin_adresa,
                 "turaSofer": tour,
+                "turaPdf": tura_pdf,
                 "locatie": locatie,
                 "numarPachet": sendungs_id,
                 "numePachet": parsed.get("auftraggeber", ""),
